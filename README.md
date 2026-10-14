@@ -21,6 +21,59 @@ agent-ws gc                       # clean up after crashes (--dry-run to preview
 Every command accepts `--json`. Timings are from a 2.7k-file repository with
 700 npm packages.
 
+## How it works
+
+Lifecycle of one workspace:
+
+```mermaid
+flowchart LR
+    A[agent-ws spawn NAME] --> B{fresh pooled<br/>workspace?}
+    B -- yes --> C[claim by atomic rename<br/>~40 ms]
+    B -- no --> D[clone fresh<br/>~1 s]
+    C --> E[workspace ready<br/>meta/NAME.json]
+    D --> E
+    C -. starts .-> R[background pool fill]
+    E --> W[agent works in<br/>agent-ws path NAME]
+    W --> S[agent-ws status<br/>changes + OVERLAP]
+    W --> L[agent-ws land NAME -m MSG]
+    W --> X[agent-ws drop NAME]
+    L --> L1[git add -A + commit<br/>trailers Agent-Ws, Agent-Ws-Base]
+    L1 --> L2[branch agent-ws/NAME<br/>in the main repo]
+    L2 --> X
+    X --> T[rename into .trash<br/>rm -rf in background]
+```
+
+What a fresh clone does:
+
+```mermaid
+flowchart TD
+    A[claim name:<br/>meta/NAME.json state=creating, pid] --> B[checks: same APFS volume,<br/>free disk, resolve base commit]
+    B --> C[git worktree add --no-checkout --detach]
+    C --> D[clonefile per top-level entry<br/>skip .git, .claude/worktrees, exclude]
+    D --> E[git reset, checkout -f, clean -fd<br/>= base commit + ignored files]
+    E --> F[one scan of the tree]
+    F --> F1[absolute links into the repo<br/>retargeted]
+    F --> F2[links leaving the workspace<br/>reported or strict fail]
+    F --> F3[untracked secret files<br/>deleted]
+    F1 & F2 & F3 --> G[meta state=ready]
+    B -. error .-> Z[discard tree, remove meta]
+    E -. error .-> Z
+```
+
+Pool records and who may touch them:
+
+```mermaid
+stateDiagram-v2
+    [*] --> creating: pool fill writes pool/ID.json
+    creating --> pooled: clone done
+    creating --> [*]: fill died, gc discards
+    pooled --> claimed: spawn renames to ID.claim-PID
+    pooled --> [*]: stale (HEAD, config or stamp changed), fill discards
+    claimed --> ready: meta/NAME.json written, claim removed
+    claimed --> [*]: claimer died, gc discards
+    ready --> [*]: land or drop
+```
+
 ## What a workspace contains
 
 - Tracked files at the base commit (`--base`, default `HEAD`). Uncommitted
