@@ -86,8 +86,9 @@ stateDiagram-v2
 - Not untracked secret files, wherever they are (also inside ignored
   folders): `.env`, `.env.*`, `.dev.vars`, `*.pem`, `*.key`, `*.p12`,
   `id_rsa`, `id_ed25519`, except `.env.example`, `.env.sample` and
-  `.env.template`. Tracked files are never removed. Keep secrets with
-  `--keep-secrets`.
+  `.env.template`. Tracked files are never removed. Every removed secret is
+  listed in the spawn output. `--keep-secrets` keeps them, including untracked
+  secrets that are not ignored (other untracked files are still left out).
 - Checked-out submodules with their own copy of the submodule's git dir, at
   the commit the base records. Commits made inside a submodule stay in the
   workspace; `land` records the new submodule commit in the parent.
@@ -135,7 +136,8 @@ Unknown keys are an error.
 - `land` always adds a commit carrying the message and the `Agent-Ws`
   trailers (empty if the agent already committed everything). It refuses to
   overwrite an existing branch (`--branch NAME` or `--force-branch`), except
-  that a branch already at the workspace's HEAD finishes an interrupted land.
+  that a branch already at the workspace's HEAD finishes an interrupted land,
+  and a branch this workspace landed earlier (`land --keep`) moves forward.
   It keeps the workspace when it fails and reports files other workspaces
   also changed. Changed files count every path touched: a rename is two.
 - `drop` renames the tree into `.trash` and deletes it in the background.

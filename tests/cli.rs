@@ -609,3 +609,64 @@ fn f7_submodules_get_their_own_isolated_git_dir() {
     let tree = git(&e.repo, &["ls-tree", "agent-ws/s1", "sm"]);
     assert!(tree.contains(&ws_sm_head), "landed branch records the new submodule commit: {tree}");
 }
+
+// ---- Fixes for the re-review (REPORT-glm-2.md N1-N3) ----
+
+#[test]
+fn n1_paths_must_match_exactly_not_just_by_components() {
+    let e = Env::new();
+    let victim = path_of(&e.ok(&["spawn", "victim"]));
+    let dir = home_dir(&e);
+    let head = git(&e.repo, &["rev-parse", "HEAD"]);
+    let slash = PathBuf::from(format!("{}/", victim.display()));
+    let double = PathBuf::from(victim.display().to_string().replace("/ws/", "/ws//"));
+    forge(&dir, "meta", "evil", &slash, "ready", &head);
+    forge(&dir, "meta", "evil2", &double, "ready", &head);
+    forge(&dir, "pool", "@pool-7", &slash, "creating", &head);
+
+    assert!(e.err(&["drop", "evil"]).contains("corrupt"));
+    assert!(e.err(&["drop", "evil2"]).contains("corrupt"));
+    let g = e.ok(&["gc"]);
+    assert_eq!(g["corrupt"], serde_json::json!(["@pool-7", "evil", "evil2"]));
+    assert!(victim.join("a.txt").exists(), "the named workspace survives");
+    assert_eq!(e.ok(&["path", "victim"])["path"], serde_json::json!(victim));
+}
+
+#[test]
+fn n2_land_again_after_keep_fast_forwards_its_own_branch() {
+    let e = Env::new();
+    let ws = path_of(&e.ok(&["spawn", "k"]));
+    fs::write(ws.join("a.txt"), "first\n").unwrap();
+    let first = e.ok(&["land", "k", "-m", "first", "--keep"]);
+    fs::write(ws.join("b.txt"), "second\n").unwrap();
+    let second = e.ok(&["land", "k", "-m", "second"]);
+    assert_eq!(second["branch"], "agent-ws/k");
+    assert_eq!(git(&e.repo, &["rev-parse", "agent-ws/k~1"]), first["commit"].as_str().unwrap(), "fast-forward on top of the first land");
+    assert!(git(&e.repo, &["log", "-1", "--format=%B", "agent-ws/k"]).starts_with("second"));
+    assert!(!ws.exists());
+
+    // A branch this workspace did not land is still refused, even when it is an ancestor.
+    let ws = path_of(&e.ok(&["spawn", "k2"]));
+    git(&e.repo, &["branch", "agent-ws/k2", "HEAD"]);
+    fs::write(ws.join("a.txt"), "x\n").unwrap();
+    assert!(e.err(&["land", "k2", "-m", "x"]).contains("--branch"));
+}
+
+#[test]
+fn n3_untracked_unignored_secrets_are_reported_and_keepable() {
+    let e = Env::new();
+    fs::write(e.repo.join("cert.pem"), "key").unwrap();
+    fs::write(e.repo.join("scratch.txt"), "work in progress").unwrap();
+    fs::create_dir(e.repo.join("conf")).unwrap();
+    fs::write(e.repo.join("conf/id_rsa"), "key").unwrap();
+
+    let s = e.ok(&["spawn", "w1"]);
+    let ws = path_of(&s);
+    assert_eq!(s["secrets_removed"], serde_json::json!([".env", "cert.pem", "conf/id_rsa"]));
+    assert!(!ws.join("cert.pem").exists() && !ws.join("scratch.txt").exists());
+
+    let kept = path_of(&e.ok(&["spawn", "w2", "--keep-secrets"]));
+    assert_eq!(fs::read_to_string(kept.join("cert.pem")).unwrap(), "key");
+    assert!(kept.join("conf/id_rsa").exists() && kept.join(".env").exists());
+    assert!(!kept.join("scratch.txt").exists(), "other untracked files are still left out");
+}

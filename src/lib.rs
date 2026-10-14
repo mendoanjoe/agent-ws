@@ -267,7 +267,9 @@ impl Repo {
         let Some(name) = path.file_name().and_then(|n| n.to_str()) else { return false };
         let named = check_name(name).is_ok()
             || name.strip_prefix(POOL_PREFIX).is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()));
-        named && path.parent() == Some(&self.dir.join("ws"))
+        // Compare the exact text: `Path` equality ignores a trailing `/` and
+        // repeated separators, which would let a record name `ws/x/` pass.
+        named && path.as_os_str() == self.dir.join("ws").join(name).as_os_str()
     }
 
     pub fn meta(&self, name: &str) -> Result<Meta> {
@@ -490,7 +492,31 @@ impl Repo {
         // edits and untracked files. Ignored files (deps, caches) stay.
         git::run(path, &["reset", "-q"])?;
         git::run(path, &["checkout", "-q", "-f", "--", "."])?;
+        // `clean` removes untracked, not-ignored files. Secrets among them are
+        // reported as removed, or set aside and put back with --keep-secrets.
+        let untracked = git::run(path, &["ls-files", "-o", "--exclude-standard", "-z"])?;
+        let mut cleaned_secrets: Vec<String> = untracked
+            .split('\0')
+            .filter(|r| Path::new(r).file_name().and_then(|n| n.to_str()).is_some_and(|n| self.config.is_secret(n)))
+            .map(String::from)
+            .collect();
+        let hold = self.dir.join(".trash").join(format!("hold-{}", nanos()));
+        if o.keep_secrets {
+            for rel in &cleaned_secrets {
+                let held = hold.join(rel);
+                std::fs::create_dir_all(held.parent().context("no parent")?)?;
+                std::fs::rename(path.join(rel), held)?;
+            }
+        }
         git::run(path, &["clean", "-fdq"])?;
+        if o.keep_secrets {
+            for rel in cleaned_secrets.drain(..) {
+                let back = path.join(&rel);
+                std::fs::create_dir_all(back.parent().context("no parent")?)?;
+                std::fs::rename(hold.join(&rel), back)?;
+            }
+            let _ = std::fs::remove_dir_all(&hold);
+        }
         if path.join(".gitmodules").exists() {
             isolate_submodules(path, &self.root, "HEAD")?;
         }
@@ -508,7 +534,12 @@ impl Repo {
         let notes = Notes {
             symlinks_retargeted: scan.retargeted,
             symlinks_external: scan.external.into_iter().map(|(path, target)| ExternalLink { path, target }).collect(),
-            secrets_removed: scan.secrets,
+            secrets_removed: {
+                let mut all = scan.secrets;
+                all.extend(cleaned_secrets);
+                all.sort();
+                all
+            },
         };
         Ok((clone_ms, calls, notes))
     }
@@ -760,7 +791,21 @@ impl Repo {
         // An earlier land created the branch at this workspace's HEAD and
         // stopped before removing the workspace: finish that land.
         let resume = existing.as_deref() == Some(head.as_str()) && clean && head != m.base;
-        if existing.is_some() && !resume && !o.force_branch {
+        // An earlier `land --keep` of this workspace: its tip is an ancestor
+        // of HEAD and carries this workspace's trailer, so moving the branch
+        // forward loses nothing. Branches anyone else made are left alone.
+        let advance = !resume
+            && existing.as_deref().is_some_and(|tip| {
+                let ancestor = std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(&m.path)
+                    .args(["merge-base", "--is-ancestor", tip, &head])
+                    .status()
+                    .is_ok_and(|s| s.success());
+                let landed_by = git::line(&m.path, &["log", "-1", "--format=%(trailers:key=Agent-Ws,valueonly)", tip]);
+                ancestor && landed_by.is_ok_and(|n| n == o.name)
+            });
+        if existing.is_some() && !resume && !advance && !o.force_branch {
             bail!("branch {branch} already exists and does not match this workspace; pass --branch NAME or --force-branch");
         }
         let mut overlaps: BTreeMap<String, Vec<String>> = BTreeMap::new();
@@ -786,7 +831,7 @@ impl Repo {
             }
             git::run(&m.path, &args)?;
             let commit = git::line(&m.path, &["rev-parse", "HEAD"])?;
-            let flag = if o.force_branch { "-f" } else { "--no-track" };
+            let flag = if o.force_branch || advance { "-f" } else { "--no-track" };
             git::run(&self.root, &["branch", flag, &branch, &commit])?;
             commit
         };
