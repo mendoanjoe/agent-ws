@@ -2,6 +2,12 @@
 name = "agent-ws"
 version = "0.1.0"
 edition = "2024"
+description = "Instant, isolated workspaces for coding agents on macOS (APFS clone-on-write)"
+license = "MIT"
+repository = "https://github.com/mendoanjoe/agent-ws"
+readme = "README.md"
+keywords = ["git", "worktree", "agent", "apfs", "workspace"]
+categories = ["command-line-utilities", "development-tools::version-control"]
 
 [dependencies]
 anyhow = "1.0.104"
