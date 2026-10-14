@@ -66,6 +66,11 @@ W=$(agent-ws path task-42)
 agent-ws land task-42 -m "feat: task 42"
 ```
 
+Each agent starts a little differently (`codex -C`, `omp --cwd`, the `cd`
+subshell for `claude` and `cursor-agent`, …). [docs/agents.md](docs/agents.md)
+has a verified, copy-paste recipe for Claude Code, Codex, opencode, omp, Cursor
+Agent and aider — interactive and headless — plus a parallel-fleet script.
+
 Several agents in parallel:
 
 ```sh
