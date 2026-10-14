@@ -19,7 +19,39 @@ agent-ws gc                       # clean up after crashes (--dry-run to preview
 ```
 
 Every command accepts `--json`. Timings are from a 2.7k-file repository with
-700 npm packages.
+700 npm packages (see [Benchmarks](#benchmarks)).
+
+## Benchmarks
+
+Apple M4 (10 cores, 16 GB), macOS 26.6, APFS, git 2.39. Repository: a private
+TypeScript monorepo with 2,693 tracked files and 26,411 files in `node_modules`
+(pnpm). Each cell is the range over two runs of `bench/bench.sh`, each value
+the median of 3 tries.
+
+| Step | `git worktree` | agent-ws |
+| --- | --- | --- |
+| New workspace, ready to build | 2.5 – 4.8 s (add + `pnpm install`) | 1.16 – 1.38 s (fresh clone) |
+| New workspace from the pool | — | 41 – 43 ms |
+| 8 new workspaces at once (wall time) | — | 4.6 – 5.1 s fresh, 75 – 81 ms from the pool |
+| Remove a workspace | 2.2 – 2.8 s (`worktree remove`) | 33 – 36 ms (`drop`) |
+| Disk per workspace | full copy of tracked files and deps | 13 – 15 MB real (820 MB logical) |
+
+Notes:
+
+- The install ran with a warm pnpm store, `--offline` and `--ignore-scripts`,
+  the best case for `git worktree`; a cold store or postinstall scripts make
+  it much slower.
+- `drop` returns at once; the tree is deleted in the background.
+- Disk is measured as the drop in free space after 5 fresh workspaces; `du`
+  shows the logical size because clones share blocks.
+- The first build or typecheck in a new workspace still reads files cold.
+
+Reproduce on a throwaway APFS copy of your repository:
+
+```sh
+cp -c -R my-repo /tmp/my-repo-copy        # same volume as your home folder
+bench/bench.sh /tmp/my-repo-copy "pnpm install --frozen-lockfile --offline"
+```
 
 ## How it works
 
@@ -98,7 +130,7 @@ stateDiagram-v2
 `agent-ws pool set N` keeps N workspaces ready. A spawn takes one with an
 atomic rename (8 parallel spawns: 80 ms wall time, ~40 ms each) and starts a
 background `pool fill` to replace it. Without a pool, parallel spawns contend
-for the disk (8 at once: ~4.4 s).
+for the disk (8 at once: ~5 s).
 
 A pooled workspace is used only while it still matches: same `HEAD`, same
 config, and unchanged lockfiles and `node_modules` stamp files
