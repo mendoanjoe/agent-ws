@@ -7,7 +7,7 @@ license = "MIT"
 repository = "https://github.com/mendoanjoe/agent-ws"
 readme = "README.md"
 keywords = ["git", "worktree", "agent", "apfs", "workspace"]
-categories = ["command-line-utilities", "development-tools::version-control"]
+categories = ["command-line-utilities", "development-tools", "filesystem"]
 
 [dependencies]
 anyhow = "1.0.104"
