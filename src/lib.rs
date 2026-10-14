@@ -47,6 +47,10 @@ pub struct Meta {
     /// Process creating or claiming the workspace (0 when idle).
     #[serde(default)]
     pub pid: u32,
+    /// Start time of `pid` in microseconds, so a reused pid is not mistaken
+    /// for the spawner (0 in records written before this field existed).
+    #[serde(default)]
+    pub pid_start: u64,
     /// Freshness key of a pooled workspace (see `Repo::pool_key`).
     #[serde(default)]
     pub key: String,
@@ -88,6 +92,9 @@ pub struct Spawned {
 
 #[derive(Serialize, Default)]
 pub struct Gc {
+    /// Records whose path is not a workspace folder of this repository.
+    /// Only the record is removed; the path is never touched.
+    pub corrupt: Vec<String>,
     /// Spawns or pool fills whose process died midway.
     pub interrupted: Vec<String>,
     /// Records whose directory was deleted by hand.
@@ -252,10 +259,25 @@ impl Repo {
         self.dir.join("meta").join(format!("{name}.json"))
     }
 
+    /// Whether `path` is a workspace folder this tool created: a direct child
+    /// of `<dir>/ws` named like a workspace or a pool entry. Records are
+    /// plain files anyone can edit, so every destructive or git operation on
+    /// a record's path checks this first.
+    pub fn owns(&self, path: &Path) -> bool {
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else { return false };
+        let named = check_name(name).is_ok()
+            || name.strip_prefix(POOL_PREFIX).is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()));
+        named && path.parent() == Some(&self.dir.join("ws"))
+    }
+
     pub fn meta(&self, name: &str) -> Result<Meta> {
+        check_name(name)?;
         let p = self.meta_path(name);
         let raw = std::fs::read(&p).with_context(|| format!("no workspace named {name:?}"))?;
         let m: Meta = serde_json::from_slice(&raw)?;
+        if !self.owns(&m.path) {
+            bail!("corrupt record for {name:?}: path {} is not a workspace folder (run `agent-ws gc`)", m.path.display());
+        }
         if m.state != "ready" {
             bail!("workspace {name:?} is still being created (run `agent-ws gc` if its spawn died)");
         }
@@ -264,7 +286,11 @@ impl Repo {
 
     /// Workspaces that finished spawning.
     pub fn list(&self) -> Result<Vec<Meta>> {
-        Ok(read_records(&self.dir.join("meta"), ".json").into_iter().map(|(_, m)| m).filter(|m| m.state == "ready").collect())
+        Ok(read_records(&self.dir.join("meta"), ".json")
+            .into_iter()
+            .map(|(_, m)| m)
+            .filter(|m| m.state == "ready" && self.owns(&m.path))
+            .collect())
     }
 
     fn prepare_home(&self) -> Result<()> {
@@ -351,6 +377,7 @@ impl Repo {
             created: now(),
             state: "creating".into(),
             pid: std::process::id(),
+            pid_start: own_start(),
             key: String::new(),
             notes: Notes::default(),
         };
@@ -360,6 +387,7 @@ impl Repo {
                 meta.base = s.base.clone();
                 meta.state = ready();
                 meta.pid = 0;
+                meta.pid_start = 0;
                 meta.notes = s.notes.clone();
                 write_record(&rec, &meta, false)?;
                 Ok(s)
@@ -374,12 +402,12 @@ impl Repo {
     /// Take a fresh pooled workspace and register it under `name`.
     fn claim(&self, name: &str, key: &str, t0: Instant) -> Result<Option<Spawned>> {
         for (rec, m) in read_records(&self.dir.join("pool"), ".json") {
-            if m.state != "pooled" || m.key != key {
+            if m.state != "pooled" || m.key != key || !self.owns(&m.path) {
                 continue;
             }
             // rename() is atomic: of several spawns racing for this entry,
             // exactly one moves the record; the others get NotFound.
-            let claim = rec.with_extension(format!("claim-{}", std::process::id()));
+            let claim = rec.with_extension(claim_ext());
             if std::fs::rename(&rec, &claim).is_err() {
                 continue;
             }
@@ -387,7 +415,8 @@ impl Repo {
                 let _ = std::fs::remove_file(&claim);
                 continue;
             }
-            let named = Meta { name: name.into(), created: now(), state: ready(), pid: 0, key: String::new(), ..m.clone() };
+            let named =
+                Meta { name: name.into(), created: now(), state: ready(), pid: 0, pid_start: 0, key: String::new(), ..m.clone() };
             if let Err(e) = write_record(&self.meta_path(name), &named, true) {
                 let _ = std::fs::rename(&claim, &rec);
                 return Err(e);
@@ -462,8 +491,12 @@ impl Repo {
         git::run(path, &["reset", "-q"])?;
         git::run(path, &["checkout", "-q", "-f", "--", "."])?;
         git::run(path, &["clean", "-fdq"])?;
+        if path.join(".gitmodules").exists() {
+            isolate_submodules(path, &self.root, "HEAD")?;
+        }
 
-        let tracked: HashSet<String> = git::run(path, &["ls-files", "-z"])?.split('\0').map(String::from).collect();
+        let tracked: HashSet<String> =
+            git::run(path, &["ls-files", "-z", "--recurse-submodules"])?.split('\0').map(String::from).collect();
         let never = |_: &str| false;
         let secret = |n: &str| self.config.is_secret(n);
         let is_secret: &dyn Fn(&str) -> bool = if o.keep_secrets { &never } else { &secret };
@@ -494,7 +527,8 @@ impl Repo {
         let mut report = PoolFill::default();
         let mut fresh = 0;
         for (rec, m) in read_records(&self.dir.join("pool"), ".json") {
-            if m.state != "pooled" {
+            // Corrupt records are left for `gc`, which forgets them safely.
+            if m.state != "pooled" || !self.owns(&m.path) {
                 continue;
             }
             let stale = m.key != key;
@@ -503,7 +537,7 @@ impl Repo {
                 continue;
             }
             // Claim before removing so a racing spawn cannot take it.
-            let claim = rec.with_extension(format!("claim-{}", std::process::id()));
+            let claim = rec.with_extension(claim_ext());
             if std::fs::rename(&rec, &claim).is_ok() {
                 self.discard(&m.path)?;
                 std::fs::remove_file(&claim)?;
@@ -522,6 +556,7 @@ impl Repo {
                 created: now(),
                 state: "creating".into(),
                 pid: std::process::id(),
+                pid_start: own_start(),
                 key: key.clone(),
                 notes: Notes::default(),
             };
@@ -532,6 +567,7 @@ impl Repo {
                     meta.notes = s.notes;
                     meta.state = "pooled".into();
                     meta.pid = 0;
+                    meta.pid_start = 0;
                     write_record(&rec, &meta, false)?;
                 }
                 Err(e) => {
@@ -559,9 +595,13 @@ impl Repo {
     }
 
     /// Move a workspace tree into `.trash`, delete it in the background and
-    /// forget its worktree registration.
+    /// forget its worktree registration. Refuses any path this tool does not
+    /// own, whatever a record says.
     fn discard(&self, path: &Path) -> Result<()> {
-        if path.exists() {
+        if !self.owns(path) {
+            bail!("refusing to remove {}: not a workspace folder of this repository", path.display());
+        }
+        if path.symlink_metadata().is_ok() {
             let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("ws");
             let trash = self.dir.join(".trash").join(format!("{name}-{}", nanos()));
             std::fs::create_dir_all(self.dir.join(".trash"))?;
@@ -590,7 +630,14 @@ impl Repo {
         let mut report = Gc::default();
         let recs = read_records(&self.dir.join("meta"), ".json").into_iter().chain(read_records(&self.dir.join("pool"), ".json"));
         for (rec, m) in recs {
-            let dead = m.state == "creating" && !pid_alive(m.pid);
+            if !self.owns(&m.path) {
+                report.corrupt.push(m.name.clone());
+                if !dry_run {
+                    let _ = std::fs::remove_file(rec);
+                }
+                continue;
+            }
+            let dead = m.state == "creating" && !pid_alive(m.pid, m.pid_start);
             let missing = m.state != "creating" && !m.path.exists();
             if !(dead || missing) {
                 continue;
@@ -604,14 +651,18 @@ impl Repo {
         // A claim file whose process died: if a named record already points
         // at the workspace the claim had succeeded; otherwise it is lost.
         for (rec, m) in read_records(&self.dir.join("pool"), ".claim-") {
-            let pid = rec.extension().and_then(|e| e.to_str()).and_then(|e| e.strip_prefix("claim-")).and_then(|p| p.parse().ok());
-            if pid.is_some_and(pid_alive) {
+            // `claim-<pid>-<start>`; older claims carry only the pid.
+            let ext = rec.extension().and_then(|e| e.to_str()).and_then(|e| e.strip_prefix("claim-")).unwrap_or("");
+            let mut parts = ext.splitn(2, '-');
+            let pid = parts.next().and_then(|p| p.parse::<u32>().ok());
+            let start = parts.next().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+            if pid.is_some_and(|p| pid_alive(p, start)) {
                 continue;
             }
             report.claims += 1;
             if !dry_run {
                 let owned = read_records(&self.dir.join("meta"), ".json").iter().any(|(_, n)| n.path == m.path);
-                if !owned {
+                if !owned && self.owns(&m.path) {
                     self.discard(&m.path)?;
                 }
                 let _ = std::fs::remove_file(rec);
@@ -622,8 +673,9 @@ impl Repo {
             for e in rd {
                 let e = e?;
                 let path = e.path();
+                // Folders whose name this tool never creates are left alone.
                 // Re-read on a miss: a spawn may have registered it meanwhile.
-                if refs.contains(&path) || {
+                if !self.owns(&path) || refs.contains(&path) || {
                     refs = self.referenced();
                     refs.contains(&path)
                 } {
@@ -656,6 +708,7 @@ impl Repo {
             git::run(&self.root, &["worktree", "prune"])?;
         }
         report.orphans.sort();
+        report.corrupt.sort();
         Ok(report)
     }
 
@@ -701,8 +754,14 @@ impl Repo {
             bail!("workspace {:?} has no changes", o.name);
         }
         let branch = o.branch.clone().unwrap_or_else(|| format!("agent-ws/{}", o.name));
-        if !o.force_branch && git::run(&self.root, &["rev-parse", "--verify", "--quiet", &format!("refs/heads/{branch}")]).is_ok() {
-            bail!("branch {branch} already exists (use --force-branch)");
+        let existing = git::line(&self.root, &["rev-parse", "--verify", "--quiet", &format!("refs/heads/{branch}")]).ok();
+        let head = git::line(&m.path, &["rev-parse", "HEAD"])?;
+        let clean = git::run(&m.path, &["status", "--porcelain"])?.trim().is_empty();
+        // An earlier land created the branch at this workspace's HEAD and
+        // stopped before removing the workspace: finish that land.
+        let resume = existing.as_deref() == Some(head.as_str()) && clean && head != m.base;
+        if existing.is_some() && !resume && !o.force_branch {
+            bail!("branch {branch} already exists and does not match this workspace; pass --branch NAME or --force-branch");
         }
         let mut overlaps: BTreeMap<String, Vec<String>> = BTreeMap::new();
         for (other, changed) in self.changes()? {
@@ -712,20 +771,25 @@ impl Repo {
                 }
             }
         }
-        git::run(&m.path, &["add", "-A"])?;
-        let staged = std::process::Command::new("git").arg("-C").arg(&m.path).args(["diff", "--cached", "--quiet"]).status()?;
-        if !staged.success() {
+        let commit = if resume {
+            head
+        } else {
+            git::run(&m.path, &["add", "-A"])?;
+            // Always commit, empty if the agent already committed everything,
+            // so the branch tip carries the message and the trailers.
             let ws_trailer = format!("Agent-Ws: {}", o.name);
             let base_trailer = format!("Agent-Ws-Base: {}", m.base);
-            let mut args = vec!["commit", "-q", "-m", &o.message, "--trailer", &ws_trailer, "--trailer", &base_trailer];
+            let mut args =
+                vec!["commit", "-q", "--allow-empty", "-m", &o.message, "--trailer", &ws_trailer, "--trailer", &base_trailer];
             if o.no_verify {
                 args.push("--no-verify");
             }
             git::run(&m.path, &args)?;
-        }
-        let commit = git::line(&m.path, &["rev-parse", "HEAD"])?;
-        let flag = if o.force_branch { "-f" } else { "--no-track" };
-        git::run(&self.root, &["branch", flag, &branch, &commit])?;
+            let commit = git::line(&m.path, &["rev-parse", "HEAD"])?;
+            let flag = if o.force_branch { "-f" } else { "--no-track" };
+            git::run(&self.root, &["branch", flag, &branch, &commit])?;
+            commit
+        };
         if !o.keep {
             self.drop(&o.name)?;
         }
@@ -742,6 +806,45 @@ impl Repo {
     }
 }
 
+/// Give every checked-out submodule its own copy of its git dir, then check
+/// out the commit `rev` records for it (recursively).
+///
+/// A cloned submodule has a `.git` file pointing at `../.git/modules/<name>`
+/// relative to the source checkout, which does not exist in a workspace.
+/// Pointing it back at the source's git dir would share its index and HEAD,
+/// so the git dir is cloned instead (copy-on-write, like everything else).
+fn isolate_submodules(ws_repo: &Path, src_repo: &Path, rev: &str) -> Result<()> {
+    let tree = git::run(ws_repo, &["ls-tree", "-r", "-z", rev])?;
+    // Entries look like `160000 commit <sha>\t<path>`.
+    for entry in tree.split('\0').filter(|e| e.starts_with("160000 ")) {
+        let Some((head, rel)) = entry.split_once('\t') else { continue };
+        let sha = head.rsplit(' ').next().unwrap_or_default();
+        let (ws_sm, src_sm) = (ws_repo.join(rel), src_repo.join(rel));
+        let dotgit = ws_sm.join(".git");
+        // Not initialised in the source: nothing checked out to fix.
+        let Ok(md) = dotgit.symlink_metadata() else { continue };
+        if md.is_file() {
+            let raw = std::fs::read_to_string(&dotgit)?;
+            let Some(gd) = raw.trim().strip_prefix("gitdir:").map(str::trim) else {
+                bail!("submodule {rel}: unexpected .git file");
+            };
+            let gitdir = src_sm.join(gd).canonicalize().with_context(|| format!("submodule {rel}: git dir {gd} not found"))?;
+            std::fs::remove_file(&dotgit)?;
+            fsutil::clone_path(&gitdir, &dotgit)?;
+            // The copy sits inside the tree it describes; the source's
+            // core.worktree points elsewhere and breaks every git command
+            // there (even `git -C <submodule> config`), so edit the config
+            // file from a directory outside any repository.
+            let config = dotgit.join("config").to_string_lossy().into_owned();
+            let _ = git::run(Path::new("/"), &["config", "--file", &config, "--unset", "core.worktree"]);
+        }
+        git::run(&ws_sm, &["checkout", "-q", "-f", "--detach", sha])?;
+        git::run(&ws_sm, &["clean", "-fdq"])?;
+        isolate_submodules(&ws_sm, &src_sm, sha)?;
+    }
+    Ok(())
+}
+
 fn delete_in_background(path: &Path) -> Result<()> {
     std::process::Command::new("rm")
         .arg("-rf")
@@ -753,9 +856,35 @@ fn delete_in_background(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn pid_alive(pid: u32) -> bool {
+/// Start time of a process in microseconds since the epoch.
+fn process_start(pid: u32) -> Option<u64> {
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    let got = unsafe {
+        libc::proc_pidinfo(pid as libc::c_int, libc::PROC_PIDTBSDINFO, 0, (&raw mut info).cast(), size)
+    };
+    (got == size).then(|| info.pbi_start_tvsec * 1_000_000 + info.pbi_start_tvusec)
+}
+
+fn own_start() -> u64 {
+    process_start(std::process::id()).unwrap_or(0)
+}
+
+/// Extension of a pool claim file: `claim-<pid>-<start>`.
+fn claim_ext() -> String {
+    format!("claim-{}-{}", std::process::id(), own_start())
+}
+
+/// Whether the process that wrote a record still runs. With a recorded start
+/// time, a different process that got the same pid does not count.
+fn pid_alive(pid: u32, start: u64) -> bool {
     if pid == 0 {
         return false;
+    }
+    if start != 0
+        && let Some(actual) = process_start(pid)
+    {
+        return actual == start;
     }
     // Signal 0 checks existence; EPERM means it exists under another user.
     unsafe { libc::kill(pid as libc::pid_t, 0) == 0 || *libc::__error() == libc::EPERM }

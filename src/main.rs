@@ -89,6 +89,12 @@ enum PoolCmd {
     Clear,
 }
 
+/// First 12 characters of a commit id; records are editable files, so a
+/// shorter value must not panic.
+fn short(id: &str) -> &str {
+    id.get(..12).unwrap_or(id)
+}
+
 fn print<T: serde::Serialize>(json: bool, v: &T, human: impl FnOnce(&T)) -> Result<()> {
     if json {
         println!("{}", serde_json::to_string_pretty(v)?);
@@ -139,7 +145,7 @@ fn run(cli: Cli) -> Result<()> {
             print(cli.json, &s, |s| {
                 println!("{}  {}", s.name, s.path.display());
                 let how = if s.from_pool { "from pool".to_string() } else { format!("clone {} ms", s.clone_ms) };
-                println!("base {}  {how}  total {} ms", &s.base[..12], s.total_ms);
+                println!("base {}  {how}  total {} ms", short(&s.base), s.total_ms);
                 for p in &s.notes.symlinks_retargeted {
                     println!("retargeted symlink {}", p.display());
                 }
@@ -153,7 +159,7 @@ fn run(cli: Cli) -> Result<()> {
         }
         Cmd::List => print(cli.json, &repo.list()?, |l| {
             for m in l {
-                println!("{:20} {}  {}", m.name, &m.base[..12], m.path.display());
+                println!("{:20} {}  {}", m.name, short(&m.base), m.path.display());
             }
         }),
         Cmd::Status { name } => print(cli.json, &repo.status(name.as_deref())?, |s| {
@@ -174,7 +180,7 @@ fn run(cli: Cli) -> Result<()> {
         Cmd::Land { name, message, branch, force_branch, keep, no_verify } => {
             let l = repo.land(&LandOpts { name, message, branch, force_branch, keep, no_verify })?;
             print(cli.json, &l, |l| {
-                println!("{} -> {} {} ({} files){}", l.name, l.branch, &l.commit[..12], l.files, if l.dropped { ", dropped" } else { "" });
+                println!("{} -> {} {} ({} files){}", l.name, l.branch, short(&l.commit), l.files, if l.dropped { ", dropped" } else { "" });
                 for (p, names) in &l.overlaps {
                     println!("OVERLAP {p}: also changed in {}", names.join(", "));
                 }

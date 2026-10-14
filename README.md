@@ -37,7 +37,7 @@ flowchart LR
     W --> S[agent-ws status<br/>changes + OVERLAP]
     W --> L[agent-ws land NAME -m MSG]
     W --> X[agent-ws drop NAME]
-    L --> L1[git add -A + commit<br/>trailers Agent-Ws, Agent-Ws-Base]
+    L --> L1[git add -A + commit, empty if needed<br/>trailers Agent-Ws, Agent-Ws-Base]
     L1 --> L2[branch agent-ws/NAME<br/>in the main repo]
     L2 --> X
     X --> T[rename into .trash<br/>rm -rf in background]
@@ -51,7 +51,8 @@ flowchart TD
     B --> C[git worktree add --no-checkout --detach]
     C --> D[clonefile per top-level entry<br/>skip .git, .claude/worktrees, exclude]
     D --> E[git reset, checkout -f, clean -fd<br/>= base commit + ignored files]
-    E --> F[one scan of the tree]
+    E --> E2[submodules: clone their git dir,<br/>checkout recorded commit]
+    E2 --> F[one scan of the tree]
     F --> F1[absolute links into the repo<br/>retargeted]
     F --> F2[links leaving the workspace<br/>reported or strict fail]
     F --> F3[untracked secret files<br/>deleted]
@@ -87,6 +88,9 @@ stateDiagram-v2
   `id_rsa`, `id_ed25519`, except `.env.example`, `.env.sample` and
   `.env.template`. Tracked files are never removed. Keep secrets with
   `--keep-secrets`.
+- Checked-out submodules with their own copy of the submodule's git dir, at
+  the commit the base records. Commits made inside a submodule stay in the
+  workspace; `land` records the new submodule commit in the parent.
 
 ## Pool
 
@@ -128,10 +132,17 @@ Unknown keys are an error.
   Relative symlinks that climb out of the repository are rewritten to the
   absolute path they meant in your checkout. Both kinds of links that leave
   the workspace are reported, and fail the spawn with `strict_symlinks`.
-- `land` refuses to overwrite an existing branch (`--force-branch` to allow),
-  keeps the workspace when it fails and reports files other workspaces also
-  changed.
+- `land` always adds a commit carrying the message and the `Agent-Ws`
+  trailers (empty if the agent already committed everything). It refuses to
+  overwrite an existing branch (`--branch NAME` or `--force-branch`), except
+  that a branch already at the workspace's HEAD finishes an interrupted land.
+  It keeps the workspace when it fails and reports files other workspaces
+  also changed. Changed files count every path touched: a rename is two.
 - `drop` renames the tree into `.trash` and deletes it in the background.
+- Records are plain JSON files, so nothing trusts them blindly: a record
+  whose path is not a workspace folder (`<home>/<repo>/ws/<name>`) is
+  reported as corrupt and never renamed, deleted or used for git commands;
+  `gc` forgets such records without touching the path.
 - Spawning stops below 2 GB of free disk.
 
 ## Many agents at once
@@ -141,7 +152,9 @@ Unknown keys are an error.
   one workspace, and a pooled workspace is never handed out twice.
 - `gc` removes spawns and pool fills whose process died, records of folders
   deleted by hand, dead pool claims, folders with no record and trash older
-  than 10 minutes. It never touches work whose process is still alive.
+  than 10 minutes, and forgets corrupt records. It never touches work whose
+  process is still alive; records store the process start time, so another
+  process that later got the same pid does not count as alive.
 
 ## Storage
 

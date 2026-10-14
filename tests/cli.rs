@@ -466,3 +466,146 @@ fn gc_recovers_dead_pool_claims() {
     assert!(!ws.exists());
     assert_eq!(e.ok(&["pool", "status"])["fresh"], 0);
 }
+
+// ---- Fixes for the 2026-10-15 review (REPORT-glm.md F0-F7) ----
+
+fn home_dir(e: &Env) -> PathBuf {
+    e.home.read_dir().unwrap().flatten().find(|d| d.path().is_dir()).unwrap().path()
+}
+
+fn forge(dir: &Path, sub: &str, name: &str, path: &Path, state: &str, base: &str) {
+    let m = serde_json::json!({
+        "name": name, "path": path, "base": base, "created": 0, "state": state, "pid": 0, "key": "",
+        "notes": { "symlinks_retargeted": [], "symlinks_external": [], "secrets_removed": [] }
+    });
+    fs::write(dir.join(sub).join(format!("{name}.json")), serde_json::to_vec(&m).unwrap()).unwrap();
+}
+
+#[test]
+fn f0_records_pointing_outside_the_workspace_folder_are_never_followed() {
+    let e = Env::new();
+    e.ok(&["spawn", "w1"]);
+    let dir = home_dir(&e);
+    let head = git(&e.repo, &["rev-parse", "HEAD"]);
+    forge(&dir, "meta", "evil", &e.repo, "ready", &head);
+    forge(&dir, "pool", "@pool-1", &e.repo, "pooled", &head);
+
+    assert!(e.err(&["drop", "evil"]).contains("corrupt"));
+    assert!(e.err(&["land", "evil", "-m", "x"]).contains("corrupt"));
+    assert!(e.err(&["path", "evil"]).contains("corrupt"));
+    e.ok(&["pool", "clear"]);
+    assert!(e.repo.join("a.txt").exists() && e.repo.join(".git").exists(), "source untouched");
+    let names: Vec<String> = e.ok(&["list"]).as_array().unwrap().iter().map(|m| m["name"].as_str().unwrap().into()).collect();
+    assert_eq!(names, ["w1"], "corrupt records are not listed");
+    e.ok(&["status"]);
+
+    let g = e.ok(&["gc"]);
+    assert_eq!(g["corrupt"], serde_json::json!(["@pool-1", "evil"]));
+    assert!(e.repo.join("a.txt").exists(), "gc only forgets corrupt records");
+    assert!(!dir.join("meta/evil.json").exists() && !dir.join("pool/@pool-1.json").exists());
+}
+
+#[test]
+fn f1_gc_is_not_fooled_by_a_reused_pid() {
+    let e = Env::new();
+    let ws = path_of(&e.ok(&["spawn", "reused"]));
+    let p = home_dir(&e).join("meta/reused.json");
+    let mut m: serde_json::Value = serde_json::from_slice(&fs::read(&p).unwrap()).unwrap();
+    // A live process (this test) whose start time differs from the spawner's.
+    m["state"] = "creating".into();
+    m["pid"] = std::process::id().into();
+    m["pid_start"] = 1.into();
+    fs::write(&p, serde_json::to_vec(&m).unwrap()).unwrap();
+    assert_eq!(e.ok(&["gc"])["interrupted"], serde_json::json!(["reused"]));
+    assert!(!ws.exists());
+}
+
+#[test]
+fn f2_land_resumes_after_a_crash_between_branch_and_drop() {
+    let e = Env::new();
+    let ws = path_of(&e.ok(&["spawn", "kk"]));
+    fs::write(ws.join("f.txt"), "hello\n").unwrap();
+    git(&ws, &["add", "-A"]);
+    git(&ws, &["commit", "-qm", "x"]);
+    let tip = git(&ws, &["rev-parse", "HEAD"]);
+    git(&e.repo, &["branch", "agent-ws/kk", &tip]);
+    let l = e.ok(&["land", "kk", "-m", "retry"]);
+    assert_eq!((l["dropped"].as_bool(), l["commit"].as_str()), (Some(true), Some(tip.as_str())));
+    assert!(!ws.exists());
+
+    // A branch that does not match the workspace is still refused, with a hint.
+    let ws = path_of(&e.ok(&["spawn", "kk2"]));
+    fs::write(ws.join("a.txt"), "other\n").unwrap();
+    assert!(e.err(&["land", "kk2", "-m", "x", "--branch", "agent-ws/kk"]).contains("--branch"));
+}
+
+#[test]
+fn f4_corrupt_short_base_does_not_crash_the_cli() {
+    let e = Env::new();
+    e.ok(&["spawn", "w1"]);
+    let p = home_dir(&e).join("meta/w1.json");
+    let mut m: serde_json::Value = serde_json::from_slice(&fs::read(&p).unwrap()).unwrap();
+    m["base"] = "x".into();
+    fs::write(&p, serde_json::to_vec(&m).unwrap()).unwrap();
+    let out = e.run(&["list"]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+}
+
+#[test]
+fn f5_land_marks_the_branch_even_when_the_agent_committed_everything() {
+    let e = Env::new();
+    let ws = path_of(&e.ok(&["spawn", "L15"]));
+    fs::write(ws.join("f.txt"), "z\n").unwrap();
+    git(&ws, &["add", "-A"]);
+    git(&ws, &["commit", "-qm", "agent work"]);
+    e.ok(&["land", "L15", "-m", "m15"]);
+    let msg = git(&e.repo, &["log", "-1", "--format=%B", "agent-ws/L15"]);
+    assert!(msg.starts_with("m15") && msg.contains("Agent-Ws: L15"), "{msg}");
+    assert_eq!(git(&e.repo, &["log", "-1", "--format=%s", "agent-ws/L15~1"]), "agent work");
+}
+
+#[test]
+fn f6_renames_count_both_paths_consistently() {
+    let e = Env::new();
+    let w1 = path_of(&e.ok(&["spawn", "w1"]));
+    let w2 = path_of(&e.ok(&["spawn", "w2"]));
+    git(&w1, &["mv", "a.txt", "renamed.txt"]);
+    fs::write(w2.join("a.txt"), "edited\n").unwrap();
+    let s = e.ok(&["status", "w1"]);
+    assert_eq!(s["workspaces"][0]["changed"], serde_json::json!(["a.txt", "renamed.txt"]));
+    assert_eq!(s["overlaps"], serde_json::json!({ "a.txt": ["w1", "w2"] }), "removing a.txt overlaps an edit of it");
+    git(&w1, &["commit", "-qm", "rename"]);
+    fs::write(w1.join("b.txt"), "b\n").unwrap();
+    assert_eq!(e.ok(&["land", "w1", "-m", "x"])["files"], 3);
+}
+
+#[test]
+fn f7_submodules_get_their_own_isolated_git_dir() {
+    let e = Env::new();
+    let inner = e.repo.parent().unwrap().join("inner");
+    fs::create_dir(&inner).unwrap();
+    git(&inner, &["init", "-q", "-b", "main"]);
+    fs::write(inner.join("i.txt"), "i\n").unwrap();
+    git(&inner, &["add", "-A"]);
+    git(&inner, &["commit", "-qm", "i"]);
+    git(&e.repo, &["-c", "protocol.file.allow=always", "submodule", "add", "-q", inner.to_str().unwrap(), "sm"]);
+    git(&e.repo, &["commit", "-qm", "add sm"]);
+    let src_sm_head = git(&e.repo.join("sm"), &["rev-parse", "HEAD"]);
+    fs::write(e.repo.join("sm/i.txt"), "dirty in source\n").unwrap();
+
+    let ws = path_of(&e.ok(&["spawn", "s1"]));
+    assert!(ws.join("sm/.git").is_dir(), "submodule has its own git dir");
+    assert_eq!(git(&ws, &["status", "--porcelain"]), "");
+    assert_eq!(fs::read_to_string(ws.join("sm/i.txt")).unwrap(), "i\n", "source edits do not leak");
+
+    fs::write(ws.join("sm/new.txt"), "n\n").unwrap();
+    git(&ws.join("sm"), &["add", "-A"]);
+    git(&ws.join("sm"), &["commit", "-qm", "inner change"]);
+    let ws_sm_head = git(&ws.join("sm"), &["rev-parse", "HEAD"]);
+    assert_eq!(git(&e.repo.join("sm"), &["rev-parse", "HEAD"]), src_sm_head, "source submodule untouched");
+    assert_eq!(fs::read_to_string(e.repo.join("sm/i.txt")).unwrap(), "dirty in source\n");
+
+    e.ok(&["land", "s1", "-m", "bump sm"]);
+    let tree = git(&e.repo, &["ls-tree", "agent-ws/s1", "sm"]);
+    assert!(tree.contains(&ws_sm_head), "landed branch records the new submodule commit: {tree}");
+}

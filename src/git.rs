@@ -16,10 +16,12 @@ pub fn line(dir: &Path, args: &[&str]) -> Result<String> {
     Ok(run(dir, args)?.trim().to_string())
 }
 
-/// Paths in `-z` porcelain status output (`XY path`, renames carry a second path).
+/// Every path a workspace touched since `base`. A rename touches two paths
+/// (the old one is removed), so rename detection is off: removing a file
+/// another workspace edits is an overlap too.
 pub fn changed_paths(dir: &Path, base: &str) -> Result<Vec<String>> {
     let mut paths = Vec::new();
-    let out = run(dir, &["status", "--porcelain=v1", "-z", "--untracked-files=all"])?;
+    let out = run(dir, &["status", "--porcelain=v1", "-z", "--untracked-files=all", "--no-renames"])?;
     let mut parts = out.split('\0').filter(|s| !s.is_empty());
     while let Some(entry) = parts.next() {
         if entry.len() > 3 {
@@ -30,7 +32,7 @@ pub fn changed_paths(dir: &Path, base: &str) -> Result<Vec<String>> {
         }
     }
     // Commits the agent made inside the workspace count as changes too.
-    for p in run(dir, &["diff", "--name-only", "-z", base, "HEAD"])?.split('\0') {
+    for p in run(dir, &["diff", "--name-only", "--no-renames", "-z", base, "HEAD"])?.split('\0') {
         if !p.is_empty() {
             paths.push(p.to_string());
         }

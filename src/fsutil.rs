@@ -98,7 +98,7 @@ fn normalize(p: &Path) -> Option<PathBuf> {
     Some(out)
 }
 
-/// Walk the workspace once (skipping its `.git` link file):
+/// Walk the workspace once (skipping every `.git` file or folder):
 /// - absolute symlinks into `src_root` are retargeted into `dst_root`;
 /// - relative symlinks that climb out of the root are rewritten to the
 ///   absolute path they meant in the source, and reported as external;
@@ -117,7 +117,9 @@ pub fn scan(
             let entry = entry?;
             let name = entry.file_name();
             let rel = rel_dir.join(&name);
-            if rel_dir.as_os_str().is_empty() && name == ".git" {
+            // The worktree's `.git` link and submodule git dirs are Git's own
+            // data, never workspace content.
+            if name == ".git" {
                 continue;
             }
             let ft = entry.file_type()?;
