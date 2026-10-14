@@ -58,7 +58,13 @@ impl Env {
     }
 
     fn run(&self, args: &[&str]) -> Output {
-        cmd(env!("CARGO_BIN_EXE_agent-ws"), &self.repo).env("AGENT_WS_HOME", &self.home).args(args).output().unwrap()
+        cmd(env!("CARGO_BIN_EXE_agent-ws"), &self.repo)
+            .env("AGENT_WS_HOME", &self.home)
+            // Background refills would race with the assertions.
+            .env("AGENT_WS_NO_REFILL", "1")
+            .args(args)
+            .output()
+            .unwrap()
     }
 
     fn ok(&self, args: &[&str]) -> serde_json::Value {
@@ -293,4 +299,170 @@ fn gc_cleans_crashes_but_not_live_spawns() {
     e.ok(&["spawn", "gone"]);
     let again = e.ok(&["gc"]);
     assert_eq!(again["interrupted"], serde_json::json!([]));
+}
+
+fn path_of(v: &serde_json::Value) -> PathBuf {
+    PathBuf::from(v["path"].as_str().unwrap())
+}
+
+#[test]
+fn secrets_inside_ignored_folders_are_removed() {
+    let e = Env::new();
+    fs::write(e.repo.join(".gitignore"), "node_modules/\n.env\n.env.*\n!.env.example\ndist\nout/\next\n.wrangler/\n*.pem\n").unwrap();
+    fs::write(e.repo.join(".env.ci"), "tracked on purpose\n").unwrap();
+    git(&e.repo, &["add", "-f", ".gitignore", ".env.ci"]);
+    git(&e.repo, &["commit", "-q", "-m", "ignore more"]);
+    fs::create_dir_all(e.repo.join(".wrangler/state")).unwrap();
+    fs::write(e.repo.join(".wrangler/state/.dev.vars"), "TOKEN=1\n").unwrap();
+    fs::write(e.repo.join(".wrangler/state/cache.json"), "{}").unwrap();
+    fs::write(e.repo.join("node_modules/dep/.env"), "X=1\n").unwrap();
+    fs::write(e.repo.join("server.pem"), "key").unwrap();
+
+    let s = e.ok(&["spawn", "w1"]);
+    let ws = path_of(&s);
+    assert_eq!(
+        s["secrets_removed"],
+        serde_json::json!([".env", ".wrangler/state/.dev.vars", "node_modules/dep/.env", "server.pem"])
+    );
+    assert!(ws.join(".wrangler/state/cache.json").exists(), "non-secret ignored files stay");
+    assert!(ws.join(".env.ci").exists(), "tracked files are never removed");
+    let kept = path_of(&e.ok(&["spawn", "w2", "--keep-secrets"]));
+    assert!(kept.join(".wrangler/state/.dev.vars").exists());
+}
+
+#[test]
+fn relative_symlinks_that_leave_the_repo_are_fixed_and_reported() {
+    let e = Env::new();
+    fs::write(e.repo.join(".gitignore"), "node_modules/\n.env\ndist\nout/\next\nup\nsub/\n").unwrap();
+    git(&e.repo, &["commit", "-qam", "ignore links"]);
+    let outside = e.repo.parent().unwrap().join("outside");
+    fs::create_dir(&outside).unwrap();
+    std::os::unix::fs::symlink("../outside", e.repo.join("up")).unwrap();
+    fs::create_dir(e.repo.join("sub")).unwrap();
+    std::os::unix::fs::symlink("../a.txt", e.repo.join("sub/inner")).unwrap();
+
+    let s = e.ok(&["spawn", "w1"]);
+    let ws = path_of(&s);
+    assert_eq!(fs::read_link(ws.join("up")).unwrap(), outside, "keeps meaning the folder it meant in the source");
+    assert_eq!(fs::read_link(ws.join("sub/inner")).unwrap(), PathBuf::from("../a.txt"), "links inside stay relative");
+    let ext: Vec<&str> = s["symlinks_external"].as_array().unwrap().iter().map(|l| l["path"].as_str().unwrap()).collect();
+    assert_eq!(ext, ["ext", "up"]);
+}
+
+#[test]
+fn config_file_controls_excludes_secrets_and_strict_symlinks() {
+    let e = Env::new();
+    fs::write(e.repo.join(".agent-ws.toml"), "exclude = [\"node_modules\"]\nsecrets = [\"*.txt\"]\nsecrets_keep = []\n").unwrap();
+    fs::write(e.repo.join("notes.txt"), "untracked but ignored? no").unwrap();
+    let s = e.ok(&["spawn", "w1"]);
+    let ws = path_of(&s);
+    assert!(!ws.join("node_modules").exists(), "config exclude applied");
+    assert!(ws.join(".env").exists(), "custom secret list replaces the defaults");
+    assert!(ws.join("a.txt").exists(), "tracked files match but stay");
+
+    fs::write(e.repo.join(".agent-ws.toml"), "strict_symlinks = true\n").unwrap();
+    assert!(e.err(&["spawn", "w2"]).contains("strict_symlinks"));
+    assert!(e.ok(&["list"]).as_array().unwrap().len() == 1, "failed strict spawn leaves nothing");
+    fs::write(e.repo.join(".agent-ws.toml"), "typo = 1\n").unwrap();
+    assert!(e.err(&["spawn", "w3"]).contains("invalid"));
+}
+
+#[test]
+fn pool_serves_spawns_and_tracks_freshness() {
+    let e = Env::new();
+    e.ok(&["pool", "set", "2"]);
+    let f = e.ok(&["pool", "fill"]);
+    assert_eq!((f["created"].as_u64(), f["ready"].as_u64()), (Some(2), Some(2)));
+
+    // Uncommitted work in the source after the fill must not matter.
+    let s = e.ok(&["spawn", "a1"]);
+    assert_eq!(s["from_pool"], true);
+    let ws = path_of(&s);
+    assert!(ws.file_name().unwrap().to_str().unwrap().starts_with("@pool-"));
+    assert_eq!(fs::read_to_string(ws.join("a.txt")).unwrap(), "one\n");
+    assert!(ws.join("node_modules/dep/index.js").exists());
+    assert_eq!(s["secrets_removed"], serde_json::json!([".env"]));
+    assert_eq!(e.ok(&["pool", "status"])["fresh"], 1);
+
+    // Landing a pooled workspace works like any other.
+    fs::write(ws.join("a.txt"), "pooled\n").unwrap();
+    e.ok(&["land", "a1", "-m", "from pool"]);
+    assert_eq!(git(&e.repo, &["show", "agent-ws/a1:a.txt"]), "pooled");
+
+    // Options that change the workspace bypass the pool.
+    assert_eq!(e.ok(&["spawn", "b1", "--keep-secrets"])["from_pool"], false);
+    assert_eq!(e.ok(&["pool", "status"])["fresh"], 1);
+
+    // A new commit makes the pool stale; spawns stop using it.
+    fs::write(e.repo.join("b.txt"), "moved\n").unwrap();
+    git(&e.repo, &["commit", "-qam", "move head"]);
+    let st = e.ok(&["pool", "status"]);
+    assert_eq!((st["fresh"].as_u64(), st["stale"].as_u64()), (Some(0), Some(1)));
+    let fresh_spawn = e.ok(&["spawn", "c1"]);
+    assert_eq!(fresh_spawn["from_pool"], false);
+    assert_eq!(fs::read_to_string(path_of(&fresh_spawn).join("b.txt")).unwrap(), "moved\n");
+    let f = e.ok(&["pool", "fill"]);
+    assert_eq!((f["removed_stale"].as_u64(), f["created"].as_u64()), (Some(1), Some(2)));
+    let d1 = e.ok(&["spawn", "d1"]);
+    assert_eq!(d1["from_pool"], true);
+    assert_eq!(fs::read_to_string(path_of(&d1).join("b.txt")).unwrap(), "moved\n");
+
+    // Dependency changes make it stale too.
+    fs::write(e.repo.join("node_modules/.modules.yaml"), "changed").unwrap();
+    assert_eq!(e.ok(&["pool", "status"])["stale"], 1);
+    assert_eq!(e.ok(&["pool", "clear"])["removed_stale"], 1);
+    let st = e.ok(&["pool", "status"]);
+    assert_eq!((st["target"].as_u64(), st["fresh"].as_u64(), st["stale"].as_u64()), (Some(2), Some(0), Some(0)));
+    assert_eq!(e.ok(&["gc"])["orphans"], serde_json::json!([]));
+}
+
+#[test]
+fn parallel_spawns_never_share_a_pooled_workspace() {
+    let e = Env::new();
+    e.ok(&["pool", "fill", "--size", "3"]);
+    let outs: Vec<serde_json::Value> = std::thread::scope(|s| {
+        let hs: Vec<_> = (0..6).map(|i| {
+            let e = &e;
+            s.spawn(move || e.ok(&["spawn", &format!("r{i}")]))
+        }).collect();
+        hs.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    let pooled: Vec<&serde_json::Value> = outs.iter().filter(|o| o["from_pool"] == true).collect();
+    assert_eq!(pooled.len(), 3, "each pooled workspace is taken once");
+    let mut paths: Vec<String> = outs.iter().map(|o| o["path"].as_str().unwrap().to_string()).collect();
+    paths.sort();
+    paths.dedup();
+    assert_eq!(paths.len(), 6);
+    assert_eq!(e.ok(&["list"]).as_array().unwrap().len(), 6);
+}
+
+#[test]
+fn land_reports_overlaps_with_other_workspaces() {
+    let e = Env::new();
+    let w1 = path_of(&e.ok(&["spawn", "w1"]));
+    let w2 = path_of(&e.ok(&["spawn", "w2"]));
+    fs::write(w1.join("a.txt"), "1\n").unwrap();
+    fs::write(w1.join("b.txt"), "1\n").unwrap();
+    fs::write(w2.join("a.txt"), "2\n").unwrap();
+    let l = e.ok(&["land", "w1", "-m", "x"]);
+    assert_eq!(l["overlaps"], serde_json::json!({ "a.txt": ["w2"] }));
+}
+
+#[test]
+fn gc_recovers_dead_pool_claims() {
+    let e = Env::new();
+    e.ok(&["pool", "fill", "--size", "1"]);
+    let pool = fs::read_dir(e.home.read_dir().unwrap().flatten().find(|d| d.path().is_dir()).unwrap().path().join("pool"))
+        .unwrap()
+        .flatten()
+        .map(|d| d.path())
+        .find(|p| p.extension().is_some_and(|x| x == "json"))
+        .unwrap();
+    let ws = path_of(&serde_json::from_slice(&fs::read(&pool).unwrap()).unwrap());
+    // A spawn that died right after taking the record.
+    fs::rename(&pool, pool.with_extension("claim-999999")).unwrap();
+    let g = e.ok(&["gc"]);
+    assert_eq!(g["claims"], 1);
+    assert!(!ws.exists());
+    assert_eq!(e.ok(&["pool", "status"])["fresh"], 0);
 }

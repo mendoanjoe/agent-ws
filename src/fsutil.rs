@@ -69,46 +69,135 @@ pub fn device(path: &Path) -> Result<u64> {
     Ok(std::fs::metadata(path)?.dev())
 }
 
-/// Symlinks found while scanning a workspace.
+/// What one pass over a fresh workspace found and fixed.
 #[derive(Default)]
-pub struct Symlinks {
+pub struct Scan {
     /// Absolute links into the source, now pointing into the workspace.
     pub retargeted: Vec<PathBuf>,
-    /// Absolute links outside the source; writes through them escape the
-    /// workspace, so callers should warn.
+    /// Links that resolve outside the workspace (absolute, or relative with
+    /// enough `..` to leave the root); writes through them escape it.
     pub external: Vec<(PathBuf, PathBuf)>,
+    /// Untracked files matching the secret patterns, deleted.
+    pub secrets: Vec<String>,
 }
 
-/// Rewrite absolute symlinks that point into `src_root` so they point into
-/// `dst_root` instead. Without this, writing through such a link from a
-/// workspace would change the source repository.
-pub fn retarget_symlinks(src_root: &Path, dst_root: &Path) -> Result<Symlinks> {
-    let mut found = Symlinks::default();
-    let mut stack = vec![dst_root.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        for entry in std::fs::read_dir(&dir)? {
+/// Remove `.`/`..` lexically. `None` when `..` climbs above the start.
+fn normalize(p: &Path) -> Option<PathBuf> {
+    let mut out = PathBuf::new();
+    for c in p.components() {
+        match c {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                if !out.pop() {
+                    return None;
+                }
+            }
+            c => out.push(c),
+        }
+    }
+    Some(out)
+}
+
+/// Walk the workspace once (skipping its `.git` link file):
+/// - absolute symlinks into `src_root` are retargeted into `dst_root`;
+/// - relative symlinks that climb out of the root are rewritten to the
+///   absolute path they meant in the source, and reported as external;
+/// - other absolute symlinks are reported as external;
+/// - untracked files whose name matches `is_secret` are deleted.
+pub fn scan(
+    src_root: &Path,
+    dst_root: &Path,
+    tracked: &std::collections::HashSet<String>,
+    is_secret: &dyn Fn(&str) -> bool,
+) -> Result<Scan> {
+    let mut found = Scan::default();
+    let mut stack = vec![PathBuf::new()];
+    while let Some(rel_dir) = stack.pop() {
+        for entry in std::fs::read_dir(dst_root.join(&rel_dir))? {
             let entry = entry?;
+            let name = entry.file_name();
+            let rel = rel_dir.join(&name);
+            if rel_dir.as_os_str().is_empty() && name == ".git" {
+                continue;
+            }
             let ft = entry.file_type()?;
             let p = entry.path();
             if ft.is_dir() {
-                stack.push(p);
+                stack.push(rel);
             } else if ft.is_symlink() {
                 let target = std::fs::read_link(&p)?;
-                let rel = p.strip_prefix(dst_root).unwrap_or(&p).to_path_buf();
                 if let Ok(rest) = target.strip_prefix(src_root) {
-                    std::fs::remove_file(&p)?;
-                    std::os::unix::fs::symlink(dst_root.join(rest), &p)?;
+                    relink(&p, &dst_root.join(rest))?;
                     found.retargeted.push(rel);
                 } else if target.is_absolute() {
                     found.external.push((rel, target));
+                } else if normalize(&rel_dir.join(&target)).is_none() {
+                    let meant = normalize(&src_root.join(&rel_dir).join(&target)).unwrap_or(target);
+                    relink(&p, &meant)?;
+                    found.external.push((rel, meant));
                 }
+            } else if is_secret(&name.to_string_lossy()) && !tracked.contains(&*rel.to_string_lossy()) {
+                std::fs::remove_file(&p)?;
+                found.secrets.push(rel.to_string_lossy().into_owned());
             }
         }
     }
+    found.retargeted.sort();
+    found.external.sort();
+    found.secrets.sort();
     Ok(found)
 }
 
-/// Basename match for secret files: `.env`, `.env.*` (not `.env.example`), `.dev.vars`.
-pub fn is_secret(name: &str) -> bool {
-    (name == ".env" || name.starts_with(".env.") || name == ".dev.vars") && name != ".env.example"
+fn relink(link: &Path, target: &Path) -> Result<()> {
+    std::fs::remove_file(link)?;
+    std::os::unix::fs::symlink(target, link)?;
+    Ok(())
+}
+
+/// Shell-style match of a whole name: `*` is any run, `?` one character.
+pub fn glob(pat: &str, name: &str) -> bool {
+    let (p, n): (Vec<char>, Vec<char>) = (pat.chars().collect(), name.chars().collect());
+    let (mut pi, mut ni, mut star, mut mark) = (0, 0, None, 0);
+    while ni < n.len() {
+        if pi < p.len() && (p[pi] == '?' || p[pi] == n[ni]) {
+            pi += 1;
+            ni += 1;
+        } else if pi < p.len() && p[pi] == '*' {
+            star = Some(pi);
+            mark = ni;
+            pi += 1;
+        } else if let Some(s) = star {
+            pi = s + 1;
+            mark += 1;
+            ni = mark;
+        } else {
+            return false;
+        }
+    }
+    p[pi..].iter().all(|&c| c == '*')
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn glob_matches_whole_names() {
+        assert!(glob(".env", ".env"));
+        assert!(glob(".env.*", ".env.local"));
+        assert!(!glob(".env.*", ".env"));
+        assert!(glob("*.pem", "server.pem"));
+        assert!(!glob("*.pem", "server.pem.bak"));
+        assert!(glob("id_?sa", "id_rsa"));
+        assert!(glob("*a*b*", "xaybz"));
+        assert!(!glob("a", "ab"));
+    }
+
+    #[test]
+    fn normalize_detects_escapes() {
+        assert_eq!(normalize(Path::new("a/../b")), Some(PathBuf::from("b")));
+        assert_eq!(normalize(Path::new("a/./b/..")), Some(PathBuf::from("a")));
+        assert_eq!(normalize(Path::new("../x")), None);
+        assert_eq!(normalize(Path::new("a/../../x")), None);
+    }
 }

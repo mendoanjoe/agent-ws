@@ -24,12 +24,15 @@ enum Cmd {
         /// Extra paths to skip, relative to the repository root.
         #[arg(long)]
         exclude: Vec<String>,
-        /// Keep ignored secret files (.env, .env.*, .dev.vars).
+        /// Keep secret files (see `secrets` in .agent-ws.toml).
         #[arg(long)]
         keep_secrets: bool,
-        /// Refuse to spawn below this much free disk space.
-        #[arg(long, default_value_t = 2)]
-        min_free_gb: u64,
+        /// Refuse to spawn below this much free disk space (default 2).
+        #[arg(long)]
+        min_free_gb: Option<u64>,
+        /// Always clone fresh instead of taking a pooled workspace.
+        #[arg(long)]
+        no_pool: bool,
     },
     /// List workspaces.
     List,
@@ -63,6 +66,27 @@ enum Cmd {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Keep ready workspaces so spawning takes milliseconds.
+    Pool {
+        #[command(subcommand)]
+        cmd: PoolCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum PoolCmd {
+    /// Set how many ready workspaces to keep (0 disables the pool).
+    Set { size: usize },
+    /// Create fresh and remove stale pooled workspaces now.
+    Fill {
+        /// Fill to this size instead of the configured target.
+        #[arg(long)]
+        size: Option<usize>,
+    },
+    /// Show target, fresh and stale pooled workspaces.
+    Status,
+    /// Remove every pooled workspace (the target is kept).
+    Clear,
 }
 
 fn print<T: serde::Serialize>(json: bool, v: &T, human: impl FnOnce(&T)) -> Result<()> {
@@ -82,21 +106,47 @@ fn main() {
     }
 }
 
+/// Top the pool up in a detached process so the caller does not wait.
+fn refill_in_background(repo: &Repo) {
+    if repo.pool_target() == 0 || std::env::var_os("AGENT_WS_NO_REFILL").is_some() {
+        return;
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        let _ = std::process::Command::new(exe)
+            .args(["pool", "fill"])
+            .current_dir(&repo.root)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+    }
+}
+
 fn run(cli: Cli) -> Result<()> {
     let repo = Repo::discover(&std::env::current_dir()?)?;
     match cli.cmd {
-        Cmd::Spawn { name, base, exclude, keep_secrets, min_free_gb } => {
-            let s = repo.spawn(&SpawnOpts { name, base, exclude, keep_secrets, min_free_bytes: min_free_gb * 1_000_000_000 })?;
+        Cmd::Spawn { name, base, exclude, keep_secrets, min_free_gb, no_pool } => {
+            let opts = SpawnOpts {
+                name,
+                base,
+                exclude,
+                keep_secrets,
+                min_free_bytes: min_free_gb.map(|g| g * 1_000_000_000),
+                use_pool: !no_pool,
+            };
+            let s = repo.spawn(&opts)?;
+            refill_in_background(&repo);
             print(cli.json, &s, |s| {
                 println!("{}  {}", s.name, s.path.display());
-                println!("base {}  clone {} ms  total {} ms", &s.base[..12], s.clone_ms, s.total_ms);
-                for p in &s.symlinks_retargeted {
+                let how = if s.from_pool { "from pool".to_string() } else { format!("clone {} ms", s.clone_ms) };
+                println!("base {}  {how}  total {} ms", &s.base[..12], s.total_ms);
+                for p in &s.notes.symlinks_retargeted {
                     println!("retargeted symlink {}", p.display());
                 }
-                for l in &s.symlinks_external {
+                for l in &s.notes.symlinks_external {
                     println!("WARNING symlink {} -> {} points outside the workspace", l.path.display(), l.target.display());
                 }
-                for p in &s.secrets_removed {
+                for p in &s.notes.secrets_removed {
                     println!("removed secret {p}");
                 }
             })
@@ -125,7 +175,14 @@ fn run(cli: Cli) -> Result<()> {
             let l = repo.land(&LandOpts { name, message, branch, force_branch, keep, no_verify })?;
             print(cli.json, &l, |l| {
                 println!("{} -> {} {} ({} files){}", l.name, l.branch, &l.commit[..12], l.files, if l.dropped { ", dropped" } else { "" });
+                for (p, names) in &l.overlaps {
+                    println!("OVERLAP {p}: also changed in {}", names.join(", "));
+                }
             })
+        }
+        Cmd::Drop { name } => {
+            repo.drop(&name)?;
+            print(cli.json, &serde_json::json!({ "dropped": name }), |_| println!("dropped {name}"))
         }
         Cmd::Gc { dry_run } => print(cli.json, &repo.gc(dry_run)?, |g| {
             let verb = if dry_run { "would remove" } else { "removed" };
@@ -138,16 +195,34 @@ fn run(cli: Cli) -> Result<()> {
             for n in &g.orphans {
                 println!("{verb} orphan folder {n}");
             }
+            if g.claims > 0 {
+                println!("{verb} {} dead pool claims", g.claims);
+            }
             if g.trash > 0 {
                 println!("{verb} {} trash entries", g.trash);
             }
-            if g.interrupted.is_empty() && g.missing.is_empty() && g.orphans.is_empty() && g.trash == 0 {
+            if g.interrupted.is_empty() && g.missing.is_empty() && g.orphans.is_empty() && g.claims == 0 && g.trash == 0 {
                 println!("nothing to clean");
             }
         }),
-        Cmd::Drop { name } => {
-            repo.drop(&name)?;
-            print(cli.json, &serde_json::json!({ "dropped": name }), |_| println!("dropped {name}"))
-        }
+        Cmd::Pool { cmd } => match cmd {
+            PoolCmd::Set { size } => {
+                repo.pool_set(size)?;
+                print(cli.json, &serde_json::json!({ "target": size }), |_| println!("pool target {size}"))
+            }
+            PoolCmd::Fill { size } => print(cli.json, &repo.pool_fill(size)?, |f| {
+                if f.busy {
+                    println!("another fill is running");
+                } else {
+                    println!("{} ready (created {}, removed {} stale, {} extra)", f.ready, f.created, f.removed_stale, f.removed_extra);
+                }
+            }),
+            PoolCmd::Status => print(cli.json, &repo.pool_status()?, |s| {
+                println!("target {}  fresh {}  stale {}  creating {}", s.target, s.fresh, s.stale, s.creating);
+            }),
+            PoolCmd::Clear => print(cli.json, &repo.pool_fill(Some(0))?, |f| {
+                println!("removed {} pooled workspaces", f.removed_stale + f.removed_extra);
+            }),
+        },
     }
 }

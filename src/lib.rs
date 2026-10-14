@@ -3,27 +3,38 @@
 //! A workspace is a Git worktree whose files are APFS clones of the source
 //! checkout, ignored files included (`node_modules`, build caches). Spawning
 //! costs metadata only, so agents skip `install` and start with warm caches.
+//! A pool of ready workspaces makes spawning a rename-sized operation.
 //! The library holds all logic so other tools (e.g. `firman`) can embed it.
 
+pub mod config;
 pub mod fsutil;
 pub mod git;
 
 use anyhow::{Context, Result, bail};
+use config::Config;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 /// Paths never cloned. `.claude/worktrees` holds other agents' checkouts.
 pub const DEFAULT_EXCLUDES: &[&str] = &[".git", ".claude/worktrees"];
 
+/// Pooled workspace ids start with `@`, which workspace names cannot contain.
+const POOL_PREFIX: &str = "@pool-";
+
+const GB: u64 = 1_000_000_000;
+
 pub struct Repo {
     /// Main checkout of the repository.
     pub root: PathBuf,
     /// State and workspaces for this repository.
     pub dir: PathBuf,
+    pub config: Config,
 }
 
+/// Records live in `meta/<name>.json` (named workspaces) and
+/// `pool/<id>.json` (pooled ones). States: `creating`, `ready`, `pooled`.
 #[derive(Serialize, Deserialize, Clone)]
 pub struct Meta {
     pub name: String,
@@ -31,28 +42,35 @@ pub struct Meta {
     /// Empty while the workspace is being created.
     pub base: String,
     pub created: u64,
-    /// `creating` until spawn finishes, then `ready`.
     #[serde(default = "ready")]
     pub state: String,
-    /// Process that is creating the workspace (0 once ready).
+    /// Process creating or claiming the workspace (0 when idle).
     #[serde(default)]
     pub pid: u32,
+    /// Freshness key of a pooled workspace (see `Repo::pool_key`).
+    #[serde(default)]
+    pub key: String,
+    #[serde(default)]
+    pub notes: Notes,
 }
 
 fn ready() -> String {
     "ready".into()
 }
 
-#[derive(Serialize, Default)]
-pub struct Gc {
-    /// Workspaces whose spawn died midway.
-    pub interrupted: Vec<String>,
-    /// Workspaces whose directory was deleted by hand.
-    pub missing: Vec<String>,
-    /// Directories under `ws/` with no workspace record.
-    pub orphans: Vec<String>,
-    /// Leftovers in `.trash` from interrupted background deletes.
-    pub trash: usize,
+/// What spawning found and fixed in a workspace.
+#[derive(Serialize, Deserialize, Clone, Default)]
+pub struct Notes {
+    pub symlinks_retargeted: Vec<PathBuf>,
+    /// Symlinks resolving outside the workspace. Writes through them leave it.
+    pub symlinks_external: Vec<ExternalLink>,
+    pub secrets_removed: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct ExternalLink {
+    pub path: PathBuf,
+    pub target: PathBuf,
 }
 
 #[derive(Serialize)]
@@ -60,20 +78,26 @@ pub struct Spawned {
     pub name: String,
     pub path: PathBuf,
     pub base: String,
+    pub from_pool: bool,
     pub clone_ms: u128,
     pub total_ms: u128,
     pub clone_calls: usize,
-    pub symlinks_retargeted: Vec<PathBuf>,
-    /// Absolute symlinks pointing outside the source checkout. Writes through
-    /// them leave the workspace.
-    pub symlinks_external: Vec<ExternalLink>,
-    pub secrets_removed: Vec<String>,
+    #[serde(flatten)]
+    pub notes: Notes,
 }
 
-#[derive(Serialize)]
-pub struct ExternalLink {
-    pub path: PathBuf,
-    pub target: PathBuf,
+#[derive(Serialize, Default)]
+pub struct Gc {
+    /// Spawns or pool fills whose process died midway.
+    pub interrupted: Vec<String>,
+    /// Records whose directory was deleted by hand.
+    pub missing: Vec<String>,
+    /// Directories under `ws/` with no record.
+    pub orphans: Vec<String>,
+    /// Pool claims whose process died.
+    pub claims: usize,
+    /// Leftovers in `.trash` from interrupted background deletes.
+    pub trash: usize,
 }
 
 #[derive(Serialize)]
@@ -98,14 +122,38 @@ pub struct Landed {
     pub commit: String,
     pub files: usize,
     pub dropped: bool,
+    /// Landed paths that other workspaces also changed.
+    pub overlaps: BTreeMap<String, Vec<String>>,
 }
 
+#[derive(Serialize, Default)]
+pub struct PoolFill {
+    /// Another fill holds the pool lock; nothing was done.
+    pub busy: bool,
+    pub created: usize,
+    pub removed_stale: usize,
+    pub removed_extra: usize,
+    pub ready: usize,
+}
+
+#[derive(Serialize)]
+pub struct PoolStatus {
+    pub target: usize,
+    pub fresh: usize,
+    pub stale: usize,
+    pub creating: usize,
+}
+
+#[derive(Clone)]
 pub struct SpawnOpts {
     pub name: String,
     pub base: Option<String>,
     pub exclude: Vec<String>,
     pub keep_secrets: bool,
-    pub min_free_bytes: u64,
+    /// Defaults to the config value, else 2 GB.
+    pub min_free_bytes: Option<u64>,
+    /// Take a ready workspace from the pool when one matches.
+    pub use_pool: bool,
 }
 
 pub struct LandOpts {
@@ -125,12 +173,16 @@ fn home() -> Result<PathBuf> {
     Ok(PathBuf::from(h).join(".agent-ws"))
 }
 
-fn fnv(s: &str) -> u32 {
-    s.bytes().fold(0x811c9dc5u32, |h, b| (h ^ b as u32).wrapping_mul(0x01000193))
+fn fnv(s: &str) -> u64 {
+    s.bytes().fold(0xcbf29ce484222325u64, |h, b| (h ^ b as u64).wrapping_mul(0x100000001b3))
 }
 
 fn now() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+fn nanos() -> u128 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0)
 }
 
 fn check_name(name: &str) -> Result<()> {
@@ -139,6 +191,43 @@ fn check_name(name: &str) -> Result<()> {
         && name.chars().all(|c| c.is_ascii_alphanumeric() || "._-".contains(c));
     if !ok {
         bail!("invalid workspace name {name:?}: use letters, digits, '.', '_' or '-'");
+    }
+    Ok(())
+}
+
+fn read_meta(p: &Path) -> Option<Meta> {
+    serde_json::from_slice(&std::fs::read(p).ok()?).ok()
+}
+
+/// Records in a directory whose file name ends with `suffix`. Records can
+/// vanish mid-scan when another process drops or claims them.
+fn read_records(dir: &Path, suffix: &str) -> Vec<(PathBuf, Meta)> {
+    let mut out: Vec<(PathBuf, Meta)> = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.contains(suffix)))
+        .filter_map(|p| read_meta(&p).map(|m| (p, m)))
+        .collect();
+    out.sort_by(|a, b| a.1.name.cmp(&b.1.name));
+    out
+}
+
+fn write_record(p: &Path, m: &Meta, create_new: bool) -> Result<()> {
+    let raw = serde_json::to_vec_pretty(m)?;
+    if create_new {
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new().write(true).create_new(true).open(p).map_err(|e| match e.kind() {
+            std::io::ErrorKind::AlreadyExists => anyhow::anyhow!("workspace {:?} already exists", m.name),
+            _ => e.into(),
+        })?;
+        f.write_all(&raw)?;
+    } else {
+        // Write then rename so readers never see a half-written record.
+        let tmp = p.with_extension(format!("tmp.{}", std::process::id()));
+        std::fs::write(&tmp, raw)?;
+        std::fs::rename(tmp, p)?;
     }
     Ok(())
 }
@@ -154,8 +243,9 @@ impl Repo {
         }
         let root = common.parent().context("no repository root")?.to_path_buf();
         let base = root.file_name().and_then(|n| n.to_str()).unwrap_or("repo");
-        let dir = home()?.join(format!("{base}-{:08x}", fnv(&root.to_string_lossy())));
-        Ok(Repo { root, dir })
+        let dir = home()?.join(format!("{base}-{:08x}", fnv(&root.to_string_lossy()) as u32));
+        let config = Config::load(&root)?;
+        Ok(Repo { root, dir, config })
     }
 
     fn meta_path(&self, name: &str) -> PathBuf {
@@ -174,51 +264,11 @@ impl Repo {
 
     /// Workspaces that finished spawning.
     pub fn list(&self) -> Result<Vec<Meta>> {
-        Ok(self.records()?.into_iter().filter(|m| m.state == "ready").collect())
-    }
-
-    /// All workspace records, including ones still being created.
-    fn records(&self) -> Result<Vec<Meta>> {
-        let mut out = Vec::new();
-        let Ok(rd) = std::fs::read_dir(self.dir.join("meta")) else { return Ok(out) };
-        for e in rd {
-            let p = e?.path();
-            if p.extension().and_then(|x| x.to_str()) == Some("json") {
-                // A record can vanish between read_dir and read when another
-                // process drops it.
-                let Ok(raw) = std::fs::read(&p) else { continue };
-                out.push(serde_json::from_slice(&raw)?);
-            }
-        }
-        out.sort_by(|a: &Meta, b| a.name.cmp(&b.name));
-        Ok(out)
-    }
-
-    fn write_meta(&self, m: &Meta, create_new: bool) -> Result<()> {
-        let p = self.meta_path(&m.name);
-        let raw = serde_json::to_vec_pretty(m)?;
-        if create_new {
-            use std::io::Write;
-            let mut f = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&p)
-                .map_err(|e| match e.kind() {
-                    std::io::ErrorKind::AlreadyExists => anyhow::anyhow!("workspace {:?} already exists", m.name),
-                    _ => e.into(),
-                })?;
-            f.write_all(&raw)?;
-        } else {
-            // Write then rename so readers never see a half-written record.
-            let tmp = p.with_extension(format!("json.{}", std::process::id()));
-            std::fs::write(&tmp, raw)?;
-            std::fs::rename(tmp, p)?;
-        }
-        Ok(())
+        Ok(read_records(&self.dir.join("meta"), ".json").into_iter().map(|(_, m)| m).filter(|m| m.state == "ready").collect())
     }
 
     fn prepare_home(&self) -> Result<()> {
-        for d in ["meta", "ws", ".trash"] {
+        for d in ["meta", "pool", "ws", ".trash"] {
             std::fs::create_dir_all(self.dir.join(d))?;
         }
         let top = self.dir.parent().context("no home")?;
@@ -239,13 +289,61 @@ impl Repo {
         Ok(())
     }
 
+    fn resolve(&self, rev: Option<&str>) -> Result<String> {
+        let rev = format!("{}^{{commit}}", rev.unwrap_or("HEAD"));
+        git::line(&self.root, &["rev-parse", "--verify", &rev])
+    }
+
+    /// A pooled workspace is reusable while HEAD, the settings that shape a
+    /// workspace and the dependency stamp files are unchanged.
+    fn pool_key(&self, head: &str) -> String {
+        use std::os::unix::fs::MetadataExt;
+        let c = &self.config;
+        let mut s = format!(
+            "{head}|{:?}|{:?}|{:?}|{}",
+            c.exclude, c.secrets, c.secrets_keep, c.strict_symlinks
+        );
+        for f in c.stamp_files() {
+            if let Ok(m) = std::fs::metadata(self.root.join(&f)) {
+                s.push_str(&format!("|{f}:{}:{}:{}", m.mtime(), m.mtime_nsec(), m.size()));
+            }
+        }
+        format!("{:016x}", fnv(&s))
+    }
+
+    pub fn pool_target(&self) -> usize {
+        let p = self.dir.join("pool.json");
+        std::fs::read(p)
+            .ok()
+            .and_then(|r| serde_json::from_slice::<serde_json::Value>(&r).ok())
+            .and_then(|v| v["size"].as_u64())
+            .map(|n| n as usize)
+            .or(self.config.pool)
+            .unwrap_or(0)
+    }
+
+    pub fn pool_set(&self, size: usize) -> Result<()> {
+        self.prepare_home()?;
+        std::fs::write(self.dir.join("pool.json"), serde_json::to_vec(&serde_json::json!({ "size": size }))?)?;
+        Ok(())
+    }
+
     pub fn spawn(&self, o: &SpawnOpts) -> Result<Spawned> {
         let t0 = Instant::now();
         check_name(&o.name)?;
         self.prepare_home()?;
+        if o.use_pool && o.exclude.is_empty() && !o.keep_secrets {
+            let head = self.resolve(None)?;
+            if self.resolve(o.base.as_deref())? == head
+                && let Some(s) = self.claim(&o.name, &self.pool_key(&head), t0)?
+            {
+                return Ok(s);
+            }
+        }
         let path = self.dir.join("ws").join(&o.name);
         // Claim the name first: the record marks the directory as in use, so
         // `gc` leaves it alone while the owning process is alive.
+        let rec = self.meta_path(&o.name);
         let mut meta = Meta {
             name: o.name.clone(),
             path: path.clone(),
@@ -253,22 +351,60 @@ impl Repo {
             created: now(),
             state: "creating".into(),
             pid: std::process::id(),
+            key: String::new(),
+            notes: Notes::default(),
         };
-        self.write_meta(&meta, true)?;
-        let result = self.create(o, &path, t0);
-        match result {
+        write_record(&rec, &meta, true)?;
+        match self.create(o, &path, t0) {
             Ok(s) => {
                 meta.base = s.base.clone();
                 meta.state = ready();
                 meta.pid = 0;
-                self.write_meta(&meta, false)?;
+                meta.notes = s.notes.clone();
+                write_record(&rec, &meta, false)?;
                 Ok(s)
             }
             Err(e) => {
-                let _ = std::fs::remove_file(self.meta_path(&o.name));
+                let _ = std::fs::remove_file(&rec);
                 Err(e)
             }
         }
+    }
+
+    /// Take a fresh pooled workspace and register it under `name`.
+    fn claim(&self, name: &str, key: &str, t0: Instant) -> Result<Option<Spawned>> {
+        for (rec, m) in read_records(&self.dir.join("pool"), ".json") {
+            if m.state != "pooled" || m.key != key {
+                continue;
+            }
+            // rename() is atomic: of several spawns racing for this entry,
+            // exactly one moves the record; the others get NotFound.
+            let claim = rec.with_extension(format!("claim-{}", std::process::id()));
+            if std::fs::rename(&rec, &claim).is_err() {
+                continue;
+            }
+            if !m.path.exists() {
+                let _ = std::fs::remove_file(&claim);
+                continue;
+            }
+            let named = Meta { name: name.into(), created: now(), state: ready(), pid: 0, key: String::new(), ..m.clone() };
+            if let Err(e) = write_record(&self.meta_path(name), &named, true) {
+                let _ = std::fs::rename(&claim, &rec);
+                return Err(e);
+            }
+            std::fs::remove_file(&claim)?;
+            return Ok(Some(Spawned {
+                name: name.into(),
+                path: m.path,
+                base: m.base,
+                from_pool: true,
+                clone_ms: 0,
+                total_ms: t0.elapsed().as_millis(),
+                clone_calls: 0,
+                notes: m.notes,
+            }));
+        }
+        Ok(None)
     }
 
     fn create(&self, o: &SpawnOpts, path: &Path, t0: Instant) -> Result<Spawned> {
@@ -282,34 +418,25 @@ impl Repo {
                 self.dir.display()
             );
         }
+        let min_free = o.min_free_bytes.or(self.config.min_free_gb.map(|g| g * GB)).unwrap_or(2 * GB);
         let free = fsutil::free_bytes(&self.dir)?;
-        if free < o.min_free_bytes {
-            bail!("only {} MB free on disk (minimum {} MB)", free / 1_000_000, o.min_free_bytes / 1_000_000);
+        if free < min_free {
+            bail!("only {} MB free on disk (minimum {} MB)", free / 1_000_000, min_free / 1_000_000);
         }
-        let rev = format!("{}^{{commit}}", o.base.as_deref().unwrap_or("HEAD"));
-        let base = git::line(&self.root, &["rev-parse", "--verify", &rev])?;
-
+        let base = self.resolve(o.base.as_deref())?;
         let p = path.to_string_lossy().to_string();
         git::run(&self.root, &["worktree", "add", "--no-checkout", "--detach", &p, &base])?;
-        let result = self.fill(o, path);
-        match result {
-            Ok((clone_ms, clone_calls, symlinks, secrets)) => {
-                Ok(Spawned {
-                    name: o.name.clone(),
-                    path: path.to_path_buf(),
-                    base,
-                    clone_ms,
-                    total_ms: t0.elapsed().as_millis(),
-                    clone_calls,
-                    symlinks_retargeted: symlinks.retargeted,
-                    symlinks_external: symlinks
-                        .external
-                        .into_iter()
-                        .map(|(path, target)| ExternalLink { path, target })
-                        .collect(),
-                    secrets_removed: secrets,
-                })
-            }
+        match self.fill(o, path) {
+            Ok((clone_ms, clone_calls, notes)) => Ok(Spawned {
+                name: o.name.clone(),
+                path: path.to_path_buf(),
+                base,
+                from_pool: false,
+                clone_ms,
+                total_ms: t0.elapsed().as_millis(),
+                clone_calls,
+                notes,
+            }),
             Err(e) => {
                 let _ = self.discard(path);
                 Err(e)
@@ -317,13 +444,126 @@ impl Repo {
         }
     }
 
+    /// Clone the checkout into `path`, then make its tracked files equal the
+    /// worktree's HEAD (the base commit).
+    fn fill(&self, o: &SpawnOpts, path: &Path) -> Result<(u128, usize, Notes)> {
+        let mut excludes: Vec<PathBuf> = DEFAULT_EXCLUDES.iter().map(PathBuf::from).collect();
+        excludes.extend(self.config.exclude.iter().chain(&o.exclude).map(PathBuf::from));
+        // Never clone the agent-ws home if it lives inside the repository.
+        if let Ok(rel) = self.dir.strip_prefix(&self.root) {
+            excludes.push(rel.components().take(1).collect());
+        }
+        let t = Instant::now();
+        let calls = fsutil::clone_tree(&self.root, path, Path::new(""), &excludes)?;
+        let clone_ms = t.elapsed().as_millis();
+
+        // Index from the base commit, then drop the source's uncommitted
+        // edits and untracked files. Ignored files (deps, caches) stay.
+        git::run(path, &["reset", "-q"])?;
+        git::run(path, &["checkout", "-q", "-f", "--", "."])?;
+        git::run(path, &["clean", "-fdq"])?;
+
+        let tracked: HashSet<String> = git::run(path, &["ls-files", "-z"])?.split('\0').map(String::from).collect();
+        let never = |_: &str| false;
+        let secret = |n: &str| self.config.is_secret(n);
+        let is_secret: &dyn Fn(&str) -> bool = if o.keep_secrets { &never } else { &secret };
+        let scan = fsutil::scan(&self.root, path, &tracked, is_secret)?;
+        if self.config.strict_symlinks && !scan.external.is_empty() {
+            let list: Vec<String> = scan.external.iter().map(|(p, t)| format!("{} -> {}", p.display(), t.display())).collect();
+            bail!("symlinks point outside the workspace (strict_symlinks): {}", list.join(", "));
+        }
+        let notes = Notes {
+            symlinks_retargeted: scan.retargeted,
+            symlinks_external: scan.external.into_iter().map(|(path, target)| ExternalLink { path, target }).collect(),
+            secrets_removed: scan.secrets,
+        };
+        Ok((clone_ms, calls, notes))
+    }
+
+    /// Bring the pool to `size` (default: the configured target) fresh
+    /// workspaces, removing stale ones. Only one fill runs at a time.
+    pub fn pool_fill(&self, size: Option<usize>) -> Result<PoolFill> {
+        self.prepare_home()?;
+        let lock = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(self.dir.join("pool.lock"))?;
+        use std::os::fd::AsRawFd;
+        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            return Ok(PoolFill { busy: true, ..Default::default() });
+        }
+        let target = size.unwrap_or_else(|| self.pool_target());
+        let key = self.pool_key(&self.resolve(None)?);
+        let mut report = PoolFill::default();
+        let mut fresh = 0;
+        for (rec, m) in read_records(&self.dir.join("pool"), ".json") {
+            if m.state != "pooled" {
+                continue;
+            }
+            let stale = m.key != key;
+            if !stale && fresh < target {
+                fresh += 1;
+                continue;
+            }
+            // Claim before removing so a racing spawn cannot take it.
+            let claim = rec.with_extension(format!("claim-{}", std::process::id()));
+            if std::fs::rename(&rec, &claim).is_ok() {
+                self.discard(&m.path)?;
+                std::fs::remove_file(&claim)?;
+                if stale { report.removed_stale += 1 } else { report.removed_extra += 1 }
+            }
+        }
+        let opts = SpawnOpts { name: String::new(), base: None, exclude: vec![], keep_secrets: false, min_free_bytes: None, use_pool: false };
+        while fresh < target {
+            let id = format!("{POOL_PREFIX}{}", nanos());
+            let rec = self.dir.join("pool").join(format!("{id}.json"));
+            let path = self.dir.join("ws").join(&id);
+            let mut meta = Meta {
+                name: id.clone(),
+                path: path.clone(),
+                base: String::new(),
+                created: now(),
+                state: "creating".into(),
+                pid: std::process::id(),
+                key: key.clone(),
+                notes: Notes::default(),
+            };
+            write_record(&rec, &meta, true)?;
+            match self.create(&SpawnOpts { name: id, ..opts.clone() }, &path, Instant::now()) {
+                Ok(s) => {
+                    meta.base = s.base;
+                    meta.notes = s.notes;
+                    meta.state = "pooled".into();
+                    meta.pid = 0;
+                    write_record(&rec, &meta, false)?;
+                }
+                Err(e) => {
+                    let _ = std::fs::remove_file(&rec);
+                    return Err(e);
+                }
+            }
+            fresh += 1;
+            report.created += 1;
+        }
+        report.ready = fresh;
+        Ok(report)
+    }
+
+    pub fn pool_status(&self) -> Result<PoolStatus> {
+        let key = self.pool_key(&self.resolve(None)?);
+        let recs = read_records(&self.dir.join("pool"), ".json");
+        let count = |f: &dyn Fn(&Meta) -> bool| recs.iter().filter(|(_, m)| f(m)).count();
+        Ok(PoolStatus {
+            target: self.pool_target(),
+            fresh: count(&|m| m.state == "pooled" && m.key == key),
+            stale: count(&|m| m.state == "pooled" && m.key != key),
+            creating: count(&|m| m.state == "creating"),
+        })
+    }
+
     /// Move a workspace tree into `.trash`, delete it in the background and
     /// forget its worktree registration.
     fn discard(&self, path: &Path) -> Result<()> {
         if path.exists() {
-            let nanos = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
             let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("ws");
-            let trash = self.dir.join(".trash").join(format!("{name}-{nanos}"));
+            let trash = self.dir.join(".trash").join(format!("{name}-{}", nanos()));
             std::fs::create_dir_all(self.dir.join(".trash"))?;
             std::fs::rename(path, &trash)?;
             delete_in_background(&trash)?;
@@ -332,40 +572,71 @@ impl Repo {
         Ok(())
     }
 
+    /// Workspace directories some record points at, including pool claims.
+    fn referenced(&self) -> HashSet<PathBuf> {
+        let mut out = HashSet::new();
+        for (_, m) in read_records(&self.dir.join("meta"), ".json") {
+            out.insert(m.path);
+        }
+        for (_, m) in read_records(&self.dir.join("pool"), ".") {
+            out.insert(m.path);
+        }
+        out
+    }
+
     /// Clean up after crashes and manual deletes. Never touches a workspace
-    /// whose spawning process is still alive.
+    /// whose creating or claiming process is still alive.
     pub fn gc(&self, dry_run: bool) -> Result<Gc> {
         let mut report = Gc::default();
-        let mut known = std::collections::HashSet::new();
-        for m in self.records()? {
-            known.insert(m.name.clone());
-            let dead = m.state != "ready" && !pid_alive(m.pid);
-            let missing = m.state == "ready" && !m.path.exists();
+        let recs = read_records(&self.dir.join("meta"), ".json").into_iter().chain(read_records(&self.dir.join("pool"), ".json"));
+        for (rec, m) in recs {
+            let dead = m.state == "creating" && !pid_alive(m.pid);
+            let missing = m.state != "creating" && !m.path.exists();
             if !(dead || missing) {
                 continue;
             }
             if dead { report.interrupted.push(m.name.clone()) } else { report.missing.push(m.name.clone()) }
             if !dry_run {
                 self.discard(&m.path)?;
-                let _ = std::fs::remove_file(self.meta_path(&m.name));
+                let _ = std::fs::remove_file(rec);
+            }
+        }
+        // A claim file whose process died: if a named record already points
+        // at the workspace the claim had succeeded; otherwise it is lost.
+        for (rec, m) in read_records(&self.dir.join("pool"), ".claim-") {
+            let pid = rec.extension().and_then(|e| e.to_str()).and_then(|e| e.strip_prefix("claim-")).and_then(|p| p.parse().ok());
+            if pid.is_some_and(pid_alive) {
+                continue;
+            }
+            report.claims += 1;
+            if !dry_run {
+                let owned = read_records(&self.dir.join("meta"), ".json").iter().any(|(_, n)| n.path == m.path);
+                if !owned {
+                    self.discard(&m.path)?;
+                }
+                let _ = std::fs::remove_file(rec);
             }
         }
         if let Ok(rd) = std::fs::read_dir(self.dir.join("ws")) {
+            let mut refs = self.referenced();
             for e in rd {
                 let e = e?;
-                let name = e.file_name().to_string_lossy().into_owned();
-                // Re-check the record: a spawn may have claimed it after the scan.
-                if known.contains(&name) || self.meta_path(&name).exists() {
+                let path = e.path();
+                // Re-read on a miss: a spawn may have registered it meanwhile.
+                if refs.contains(&path) || {
+                    refs = self.referenced();
+                    refs.contains(&path)
+                } {
                     continue;
                 }
-                report.orphans.push(name);
+                report.orphans.push(e.file_name().to_string_lossy().into_owned());
                 if !dry_run {
-                    self.discard(&e.path())?;
+                    self.discard(&path)?;
                 }
             }
         }
         if let Ok(rd) = std::fs::read_dir(self.dir.join(".trash")) {
-            let now_ns = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+            let now_ns = nanos();
             for e in rd {
                 let e = e?;
                 // Entries are named `<name>-<nanos>`. Recent ones are still
@@ -388,56 +659,32 @@ impl Repo {
         Ok(report)
     }
 
-    /// Clone the checkout into `path`, then make its tracked files equal the
-    /// worktree's HEAD (the base commit).
-    fn fill(&self, o: &SpawnOpts, path: &Path) -> Result<(u128, usize, fsutil::Symlinks, Vec<String>)> {
-        let mut excludes: Vec<PathBuf> = DEFAULT_EXCLUDES.iter().map(PathBuf::from).collect();
-        excludes.extend(o.exclude.iter().map(PathBuf::from));
-        // Never clone the agent-ws home if it lives inside the repository.
-        if let Ok(rel) = self.dir.strip_prefix(&self.root) {
-            excludes.push(rel.components().take(1).collect());
-        }
-        let t = Instant::now();
-        let calls = fsutil::clone_tree(&self.root, path, Path::new(""), &excludes)?;
-        let clone_ms = t.elapsed().as_millis();
-
-        // Index from `base`, then drop the source's uncommitted edits and
-        // untracked files. Ignored files (deps, caches) stay.
-        git::run(path, &["reset", "-q"])?;
-        git::run(path, &["checkout", "-q", "-f", "--", "."])?;
-        git::run(path, &["clean", "-fdq"])?;
-
-        let mut secrets = Vec::new();
-        if !o.keep_secrets {
-            let ignored = git::run(path, &["ls-files", "-o", "-i", "--exclude-standard", "--directory", "-z"])?;
-            for rel in ignored.split('\0').filter(|s| !s.is_empty() && !s.ends_with('/')) {
-                let name = Path::new(rel).file_name().and_then(|n| n.to_str()).unwrap_or("");
-                if fsutil::is_secret(name) {
-                    std::fs::remove_file(path.join(rel))?;
-                    secrets.push(rel.to_string());
-                }
+    /// Changed paths per ready workspace, skipping folders deleted by hand.
+    fn changes(&self) -> Result<Vec<(Meta, Vec<String>)>> {
+        let mut out = Vec::new();
+        for m in self.list()? {
+            if m.path.exists() {
+                let c = git::changed_paths(&m.path, &m.base)?;
+                out.push((m, c));
             }
         }
-        let symlinks = fsutil::retarget_symlinks(&self.root, path)?;
-        Ok((clone_ms, calls, symlinks, secrets))
+        Ok(out)
     }
 
     pub fn status(&self, only: Option<&str>) -> Result<Status> {
         // Overlaps are computed across all workspaces, even when one is selected.
-        let mut all = Vec::new();
+        let all = self.changes()?;
         let mut by_path: BTreeMap<String, Vec<String>> = BTreeMap::new();
-        for m in self.list()? {
-            // Deleted by hand; `agent-ws gc` reports and forgets it.
-            if !m.path.exists() {
-                continue;
-            }
-            let changed = git::changed_paths(&m.path, &m.base)?;
-            for p in &changed {
+        for (m, changed) in &all {
+            for p in changed {
                 by_path.entry(p.clone()).or_default().push(m.name.clone());
             }
-            all.push(WsStatus { name: m.name, path: m.path, base: m.base, changed });
         }
-        let workspaces: Vec<WsStatus> = all.into_iter().filter(|w| only.is_none_or(|n| n == w.name)).collect();
+        let workspaces: Vec<WsStatus> = all
+            .into_iter()
+            .filter(|(m, _)| only.is_none_or(|n| n == m.name))
+            .map(|(m, changed)| WsStatus { name: m.name, path: m.path, base: m.base, changed })
+            .collect();
         if let Some(n) = only
             && workspaces.is_empty()
         {
@@ -457,12 +704,16 @@ impl Repo {
         if !o.force_branch && git::run(&self.root, &["rev-parse", "--verify", "--quiet", &format!("refs/heads/{branch}")]).is_ok() {
             bail!("branch {branch} already exists (use --force-branch)");
         }
+        let mut overlaps: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for (other, changed) in self.changes()? {
+            if other.name != o.name {
+                for p in changed.into_iter().filter(|p| files.contains(p)) {
+                    overlaps.entry(p).or_default().push(other.name.clone());
+                }
+            }
+        }
         git::run(&m.path, &["add", "-A"])?;
-        let staged = std::process::Command::new("git")
-            .arg("-C")
-            .arg(&m.path)
-            .args(["diff", "--cached", "--quiet"])
-            .status()?;
+        let staged = std::process::Command::new("git").arg("-C").arg(&m.path).args(["diff", "--cached", "--quiet"]).status()?;
         if !staged.success() {
             let ws_trailer = format!("Agent-Ws: {}", o.name);
             let base_trailer = format!("Agent-Ws-Base: {}", m.base);
@@ -478,7 +729,7 @@ impl Repo {
         if !o.keep {
             self.drop(&o.name)?;
         }
-        Ok(Landed { name: o.name.clone(), branch, commit, files: files.len(), dropped: !o.keep })
+        Ok(Landed { name: o.name.clone(), branch, commit, files: files.len(), dropped: !o.keep, overlaps })
     }
 
     /// Remove a workspace. The tree is renamed into `.trash` (instant) and
