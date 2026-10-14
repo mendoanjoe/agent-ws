@@ -4,7 +4,7 @@
 //! checkout, ignored files included (`node_modules`, build caches). Spawning
 //! costs metadata only, so agents skip `install` and start with warm caches.
 //! A pool of ready workspaces makes spawning a rename-sized operation.
-//! The library holds all logic so other tools (e.g. `firman`) can embed it.
+//! The library holds all logic so other tools can embed it.
 
 pub mod config;
 pub mod fsutil;
