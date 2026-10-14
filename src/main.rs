@@ -131,7 +131,14 @@ fn refill_in_background(repo: &Repo) {
 fn run(cli: Cli) -> Result<()> {
     let repo = Repo::discover(&std::env::current_dir()?)?;
     match cli.cmd {
-        Cmd::Spawn { name, base, exclude, keep_secrets, min_free_gb, no_pool } => {
+        Cmd::Spawn {
+            name,
+            base,
+            exclude,
+            keep_secrets,
+            min_free_gb,
+            no_pool,
+        } => {
             let opts = SpawnOpts {
                 name,
                 base,
@@ -144,13 +151,21 @@ fn run(cli: Cli) -> Result<()> {
             refill_in_background(&repo);
             print(cli.json, &s, |s| {
                 println!("{}  {}", s.name, s.path.display());
-                let how = if s.from_pool { "from pool".to_string() } else { format!("clone {} ms", s.clone_ms) };
+                let how = if s.from_pool {
+                    "from pool".to_string()
+                } else {
+                    format!("clone {} ms", s.clone_ms)
+                };
                 println!("base {}  {how}  total {} ms", short(&s.base), s.total_ms);
                 for p in &s.notes.symlinks_retargeted {
                     println!("retargeted symlink {}", p.display());
                 }
                 for l in &s.notes.symlinks_external {
-                    println!("WARNING symlink {} -> {} points outside the workspace", l.path.display(), l.target.display());
+                    println!(
+                        "WARNING symlink {} -> {} points outside the workspace",
+                        l.path.display(),
+                        l.target.display()
+                    );
                 }
                 for p in &s.notes.secrets_removed {
                     println!("removed secret {p}");
@@ -175,12 +190,35 @@ fn run(cli: Cli) -> Result<()> {
         }),
         Cmd::Path { name } => {
             let path = repo.meta(&name)?.path;
-            print(cli.json, &serde_json::json!({ "path": path }), |_| println!("{}", path.display()))
+            print(cli.json, &serde_json::json!({ "path": path }), |_| {
+                println!("{}", path.display())
+            })
         }
-        Cmd::Land { name, message, branch, force_branch, keep, no_verify } => {
-            let l = repo.land(&LandOpts { name, message, branch, force_branch, keep, no_verify })?;
+        Cmd::Land {
+            name,
+            message,
+            branch,
+            force_branch,
+            keep,
+            no_verify,
+        } => {
+            let l = repo.land(&LandOpts {
+                name,
+                message,
+                branch,
+                force_branch,
+                keep,
+                no_verify,
+            })?;
             print(cli.json, &l, |l| {
-                println!("{} -> {} {} ({} files){}", l.name, l.branch, short(&l.commit), l.files, if l.dropped { ", dropped" } else { "" });
+                println!(
+                    "{} -> {} {} ({} files){}",
+                    l.name,
+                    l.branch,
+                    short(&l.commit),
+                    l.files,
+                    if l.dropped { ", dropped" } else { "" }
+                );
                 for (p, names) in &l.overlaps {
                     println!("OVERLAP {p}: also changed in {}", names.join(", "));
                 }
@@ -188,7 +226,9 @@ fn run(cli: Cli) -> Result<()> {
         }
         Cmd::Drop { name } => {
             repo.drop(&name)?;
-            print(cli.json, &serde_json::json!({ "dropped": name }), |_| println!("dropped {name}"))
+            print(cli.json, &serde_json::json!({ "dropped": name }), |_| {
+                println!("dropped {name}")
+            })
         }
         Cmd::Gc { dry_run } => print(cli.json, &repo.gc(dry_run)?, |g| {
             let verb = if dry_run { "would remove" } else { "removed" };
@@ -207,27 +247,43 @@ fn run(cli: Cli) -> Result<()> {
             if g.trash > 0 {
                 println!("{verb} {} trash entries", g.trash);
             }
-            if g.interrupted.is_empty() && g.missing.is_empty() && g.orphans.is_empty() && g.claims == 0 && g.trash == 0 {
+            if g.interrupted.is_empty()
+                && g.missing.is_empty()
+                && g.orphans.is_empty()
+                && g.claims == 0
+                && g.trash == 0
+            {
                 println!("nothing to clean");
             }
         }),
         Cmd::Pool { cmd } => match cmd {
             PoolCmd::Set { size } => {
                 repo.pool_set(size)?;
-                print(cli.json, &serde_json::json!({ "target": size }), |_| println!("pool target {size}"))
+                print(cli.json, &serde_json::json!({ "target": size }), |_| {
+                    println!("pool target {size}")
+                })
             }
             PoolCmd::Fill { size } => print(cli.json, &repo.pool_fill(size)?, |f| {
                 if f.busy {
                     println!("another fill is running");
                 } else {
-                    println!("{} ready (created {}, removed {} stale, {} extra)", f.ready, f.created, f.removed_stale, f.removed_extra);
+                    println!(
+                        "{} ready (created {}, removed {} stale, {} extra)",
+                        f.ready, f.created, f.removed_stale, f.removed_extra
+                    );
                 }
             }),
             PoolCmd::Status => print(cli.json, &repo.pool_status()?, |s| {
-                println!("target {}  fresh {}  stale {}  creating {}", s.target, s.fresh, s.stale, s.creating);
+                println!(
+                    "target {}  fresh {}  stale {}  creating {}",
+                    s.target, s.fresh, s.stale, s.creating
+                );
             }),
             PoolCmd::Clear => print(cli.json, &repo.pool_fill(Some(0))?, |f| {
-                println!("removed {} pooled workspaces", f.removed_stale + f.removed_extra);
+                println!(
+                    "removed {} pooled workspaces",
+                    f.removed_stale + f.removed_extra
+                );
             }),
         },
     }

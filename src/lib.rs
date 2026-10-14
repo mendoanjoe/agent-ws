@@ -181,21 +181,31 @@ fn home() -> Result<PathBuf> {
 }
 
 fn fnv(s: &str) -> u64 {
-    s.bytes().fold(0xcbf29ce484222325u64, |h, b| (h ^ b as u64).wrapping_mul(0x100000001b3))
+    s.bytes().fold(0xcbf29ce484222325u64, |h, b| {
+        (h ^ b as u64).wrapping_mul(0x100000001b3)
+    })
 }
 
 fn now() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 fn nanos() -> u128 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0)
 }
 
 fn check_name(name: &str) -> Result<()> {
     let ok = !name.is_empty()
         && !name.starts_with('.')
-        && name.chars().all(|c| c.is_ascii_alphanumeric() || "._-".contains(c));
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "._-".contains(c));
     if !ok {
         bail!("invalid workspace name {name:?}: use letters, digits, '.', '_' or '-'");
     }
@@ -214,7 +224,11 @@ fn read_records(dir: &Path, suffix: &str) -> Vec<(PathBuf, Meta)> {
         .flatten()
         .flatten()
         .map(|e| e.path())
-        .filter(|p| p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.contains(suffix)))
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.contains(suffix))
+        })
         .filter_map(|p| read_meta(&p).map(|m| (p, m)))
         .collect();
     out.sort_by(|a, b| a.1.name.cmp(&b.1.name));
@@ -225,10 +239,16 @@ fn write_record(p: &Path, m: &Meta, create_new: bool) -> Result<()> {
     let raw = serde_json::to_vec_pretty(m)?;
     if create_new {
         use std::io::Write;
-        let mut f = std::fs::OpenOptions::new().write(true).create_new(true).open(p).map_err(|e| match e.kind() {
-            std::io::ErrorKind::AlreadyExists => anyhow::anyhow!("workspace {:?} already exists", m.name),
-            _ => e.into(),
-        })?;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(p)
+            .map_err(|e| match e.kind() {
+                std::io::ErrorKind::AlreadyExists => {
+                    anyhow::anyhow!("workspace {:?} already exists", m.name)
+                }
+                _ => e.into(),
+            })?;
         f.write_all(&raw)?;
     } else {
         // Write then rename so readers never see a half-written record.
@@ -242,15 +262,21 @@ fn write_record(p: &Path, m: &Meta, create_new: bool) -> Result<()> {
 impl Repo {
     /// Find the repository containing `cwd`. Works from inside a workspace too.
     pub fn discover(cwd: &Path) -> Result<Repo> {
-        let common = git::line(cwd, &["rev-parse", "--path-format=absolute", "--git-common-dir"])
-            .context("not inside a Git repository")?;
+        let common = git::line(
+            cwd,
+            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        )
+        .context("not inside a Git repository")?;
         let common = PathBuf::from(common);
         if common.file_name().and_then(|n| n.to_str()) != Some(".git") {
             bail!("bare repositories are not supported ({})", common.display());
         }
         let root = common.parent().context("no repository root")?.to_path_buf();
         let base = root.file_name().and_then(|n| n.to_str()).unwrap_or("repo");
-        let dir = home()?.join(format!("{base}-{:08x}", fnv(&root.to_string_lossy()) as u32));
+        let dir = home()?.join(format!(
+            "{base}-{:08x}",
+            fnv(&root.to_string_lossy()) as u32
+        ));
         let config = Config::load(&root)?;
         Ok(Repo { root, dir, config })
     }
@@ -264,9 +290,13 @@ impl Repo {
     /// plain files anyone can edit, so every destructive or git operation on
     /// a record's path checks this first.
     pub fn owns(&self, path: &Path) -> bool {
-        let Some(name) = path.file_name().and_then(|n| n.to_str()) else { return false };
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            return false;
+        };
         let named = check_name(name).is_ok()
-            || name.strip_prefix(POOL_PREFIX).is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()));
+            || name
+                .strip_prefix(POOL_PREFIX)
+                .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()));
         // Compare the exact text: `Path` equality ignores a trailing `/` and
         // repeated separators, which would let a record name `ws/x/` pass.
         named && path.as_os_str() == self.dir.join("ws").join(name).as_os_str()
@@ -278,10 +308,15 @@ impl Repo {
         let raw = std::fs::read(&p).with_context(|| format!("no workspace named {name:?}"))?;
         let m: Meta = serde_json::from_slice(&raw)?;
         if !self.owns(&m.path) {
-            bail!("corrupt record for {name:?}: path {} is not a workspace folder (run `agent-ws gc`)", m.path.display());
+            bail!(
+                "corrupt record for {name:?}: path {} is not a workspace folder (run `agent-ws gc`)",
+                m.path.display()
+            );
         }
         if m.state != "ready" {
-            bail!("workspace {name:?} is still being created (run `agent-ws gc` if its spawn died)");
+            bail!(
+                "workspace {name:?} is still being created (run `agent-ws gc` if its spawn died)"
+            );
         }
         Ok(m)
     }
@@ -333,7 +368,12 @@ impl Repo {
         );
         for f in c.stamp_files() {
             if let Ok(m) = std::fs::metadata(self.root.join(&f)) {
-                s.push_str(&format!("|{f}:{}:{}:{}", m.mtime(), m.mtime_nsec(), m.size()));
+                s.push_str(&format!(
+                    "|{f}:{}:{}:{}",
+                    m.mtime(),
+                    m.mtime_nsec(),
+                    m.size()
+                ));
             }
         }
         format!("{:016x}", fnv(&s))
@@ -352,7 +392,10 @@ impl Repo {
 
     pub fn pool_set(&self, size: usize) -> Result<()> {
         self.prepare_home()?;
-        std::fs::write(self.dir.join("pool.json"), serde_json::to_vec(&serde_json::json!({ "size": size }))?)?;
+        std::fs::write(
+            self.dir.join("pool.json"),
+            serde_json::to_vec(&serde_json::json!({ "size": size }))?,
+        )?;
         Ok(())
     }
 
@@ -417,8 +460,15 @@ impl Repo {
                 let _ = std::fs::remove_file(&claim);
                 continue;
             }
-            let named =
-                Meta { name: name.into(), created: now(), state: ready(), pid: 0, pid_start: 0, key: String::new(), ..m.clone() };
+            let named = Meta {
+                name: name.into(),
+                created: now(),
+                state: ready(),
+                pid: 0,
+                pid_start: 0,
+                key: String::new(),
+                ..m.clone()
+            };
             if let Err(e) = write_record(&self.meta_path(name), &named, true) {
                 let _ = std::fs::rename(&claim, &rec);
                 return Err(e);
@@ -449,14 +499,24 @@ impl Repo {
                 self.dir.display()
             );
         }
-        let min_free = o.min_free_bytes.or(self.config.min_free_gb.map(|g| g * GB)).unwrap_or(2 * GB);
+        let min_free = o
+            .min_free_bytes
+            .or(self.config.min_free_gb.map(|g| g * GB))
+            .unwrap_or(2 * GB);
         let free = fsutil::free_bytes(&self.dir)?;
         if free < min_free {
-            bail!("only {} MB free on disk (minimum {} MB)", free / 1_000_000, min_free / 1_000_000);
+            bail!(
+                "only {} MB free on disk (minimum {} MB)",
+                free / 1_000_000,
+                min_free / 1_000_000
+            );
         }
         let base = self.resolve(o.base.as_deref())?;
         let p = path.to_string_lossy().to_string();
-        git::run(&self.root, &["worktree", "add", "--no-checkout", "--detach", &p, &base])?;
+        git::run(
+            &self.root,
+            &["worktree", "add", "--no-checkout", "--detach", &p, &base],
+        )?;
         match self.fill(o, path) {
             Ok((clone_ms, clone_calls, notes)) => Ok(Spawned {
                 name: o.name.clone(),
@@ -479,7 +539,13 @@ impl Repo {
     /// worktree's HEAD (the base commit).
     fn fill(&self, o: &SpawnOpts, path: &Path) -> Result<(u128, usize, Notes)> {
         let mut excludes: Vec<PathBuf> = DEFAULT_EXCLUDES.iter().map(PathBuf::from).collect();
-        excludes.extend(self.config.exclude.iter().chain(&o.exclude).map(PathBuf::from));
+        excludes.extend(
+            self.config
+                .exclude
+                .iter()
+                .chain(&o.exclude)
+                .map(PathBuf::from),
+        );
         // Never clone the agent-ws home if it lives inside the repository.
         if let Ok(rel) = self.dir.strip_prefix(&self.root) {
             excludes.push(rel.components().take(1).collect());
@@ -497,7 +563,12 @@ impl Repo {
         let untracked = git::run(path, &["ls-files", "-o", "--exclude-standard", "-z"])?;
         let mut cleaned_secrets: Vec<String> = untracked
             .split('\0')
-            .filter(|r| Path::new(r).file_name().and_then(|n| n.to_str()).is_some_and(|n| self.config.is_secret(n)))
+            .filter(|r| {
+                Path::new(r)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| self.config.is_secret(n))
+            })
             .map(String::from)
             .collect();
         let hold = self.dir.join(".trash").join(format!("hold-{}", nanos()));
@@ -521,19 +592,32 @@ impl Repo {
             isolate_submodules(path, &self.root, "HEAD")?;
         }
 
-        let tracked: HashSet<String> =
-            git::run(path, &["ls-files", "-z", "--recurse-submodules"])?.split('\0').map(String::from).collect();
+        let tracked: HashSet<String> = git::run(path, &["ls-files", "-z", "--recurse-submodules"])?
+            .split('\0')
+            .map(String::from)
+            .collect();
         let never = |_: &str| false;
         let secret = |n: &str| self.config.is_secret(n);
         let is_secret: &dyn Fn(&str) -> bool = if o.keep_secrets { &never } else { &secret };
         let scan = fsutil::scan(&self.root, path, &tracked, is_secret)?;
         if self.config.strict_symlinks && !scan.external.is_empty() {
-            let list: Vec<String> = scan.external.iter().map(|(p, t)| format!("{} -> {}", p.display(), t.display())).collect();
-            bail!("symlinks point outside the workspace (strict_symlinks): {}", list.join(", "));
+            let list: Vec<String> = scan
+                .external
+                .iter()
+                .map(|(p, t)| format!("{} -> {}", p.display(), t.display()))
+                .collect();
+            bail!(
+                "symlinks point outside the workspace (strict_symlinks): {}",
+                list.join(", ")
+            );
         }
         let notes = Notes {
             symlinks_retargeted: scan.retargeted,
-            symlinks_external: scan.external.into_iter().map(|(path, target)| ExternalLink { path, target }).collect(),
+            symlinks_external: scan
+                .external
+                .into_iter()
+                .map(|(path, target)| ExternalLink { path, target })
+                .collect(),
             secrets_removed: {
                 let mut all = scan.secrets;
                 all.extend(cleaned_secrets);
@@ -548,10 +632,17 @@ impl Repo {
     /// workspaces, removing stale ones. Only one fill runs at a time.
     pub fn pool_fill(&self, size: Option<usize>) -> Result<PoolFill> {
         self.prepare_home()?;
-        let lock = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(self.dir.join("pool.lock"))?;
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(self.dir.join("pool.lock"))?;
         use std::os::fd::AsRawFd;
         if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-            return Ok(PoolFill { busy: true, ..Default::default() });
+            return Ok(PoolFill {
+                busy: true,
+                ..Default::default()
+            });
         }
         let target = size.unwrap_or_else(|| self.pool_target());
         let key = self.pool_key(&self.resolve(None)?);
@@ -572,10 +663,21 @@ impl Repo {
             if std::fs::rename(&rec, &claim).is_ok() {
                 self.discard(&m.path)?;
                 std::fs::remove_file(&claim)?;
-                if stale { report.removed_stale += 1 } else { report.removed_extra += 1 }
+                if stale {
+                    report.removed_stale += 1
+                } else {
+                    report.removed_extra += 1
+                }
             }
         }
-        let opts = SpawnOpts { name: String::new(), base: None, exclude: vec![], keep_secrets: false, min_free_bytes: None, use_pool: false };
+        let opts = SpawnOpts {
+            name: String::new(),
+            base: None,
+            exclude: vec![],
+            keep_secrets: false,
+            min_free_bytes: None,
+            use_pool: false,
+        };
         while fresh < target {
             let id = format!("{POOL_PREFIX}{}", nanos());
             let rec = self.dir.join("pool").join(format!("{id}.json"));
@@ -592,7 +694,14 @@ impl Repo {
                 notes: Notes::default(),
             };
             write_record(&rec, &meta, true)?;
-            match self.create(&SpawnOpts { name: id, ..opts.clone() }, &path, Instant::now()) {
+            match self.create(
+                &SpawnOpts {
+                    name: id,
+                    ..opts.clone()
+                },
+                &path,
+                Instant::now(),
+            ) {
                 Ok(s) => {
                     meta.base = s.base;
                     meta.notes = s.notes;
@@ -630,7 +739,10 @@ impl Repo {
     /// own, whatever a record says.
     fn discard(&self, path: &Path) -> Result<()> {
         if !self.owns(path) {
-            bail!("refusing to remove {}: not a workspace folder of this repository", path.display());
+            bail!(
+                "refusing to remove {}: not a workspace folder of this repository",
+                path.display()
+            );
         }
         if path.symlink_metadata().is_ok() {
             let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("ws");
@@ -659,7 +771,9 @@ impl Repo {
     /// whose creating or claiming process is still alive.
     pub fn gc(&self, dry_run: bool) -> Result<Gc> {
         let mut report = Gc::default();
-        let recs = read_records(&self.dir.join("meta"), ".json").into_iter().chain(read_records(&self.dir.join("pool"), ".json"));
+        let recs = read_records(&self.dir.join("meta"), ".json")
+            .into_iter()
+            .chain(read_records(&self.dir.join("pool"), ".json"));
         for (rec, m) in recs {
             if !self.owns(&m.path) {
                 report.corrupt.push(m.name.clone());
@@ -673,7 +787,11 @@ impl Repo {
             if !(dead || missing) {
                 continue;
             }
-            if dead { report.interrupted.push(m.name.clone()) } else { report.missing.push(m.name.clone()) }
+            if dead {
+                report.interrupted.push(m.name.clone())
+            } else {
+                report.missing.push(m.name.clone())
+            }
             if !dry_run {
                 self.discard(&m.path)?;
                 let _ = std::fs::remove_file(rec);
@@ -683,16 +801,25 @@ impl Repo {
         // at the workspace the claim had succeeded; otherwise it is lost.
         for (rec, m) in read_records(&self.dir.join("pool"), ".claim-") {
             // `claim-<pid>-<start>`; older claims carry only the pid.
-            let ext = rec.extension().and_then(|e| e.to_str()).and_then(|e| e.strip_prefix("claim-")).unwrap_or("");
+            let ext = rec
+                .extension()
+                .and_then(|e| e.to_str())
+                .and_then(|e| e.strip_prefix("claim-"))
+                .unwrap_or("");
             let mut parts = ext.splitn(2, '-');
             let pid = parts.next().and_then(|p| p.parse::<u32>().ok());
-            let start = parts.next().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+            let start = parts
+                .next()
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(0);
             if pid.is_some_and(|p| pid_alive(p, start)) {
                 continue;
             }
             report.claims += 1;
             if !dry_run {
-                let owned = read_records(&self.dir.join("meta"), ".json").iter().any(|(_, n)| n.path == m.path);
+                let owned = read_records(&self.dir.join("meta"), ".json")
+                    .iter()
+                    .any(|(_, n)| n.path == m.path);
                 if !owned && self.owns(&m.path) {
                     self.discard(&m.path)?;
                 }
@@ -712,7 +839,9 @@ impl Repo {
                 } {
                     continue;
                 }
-                report.orphans.push(e.file_name().to_string_lossy().into_owned());
+                report
+                    .orphans
+                    .push(e.file_name().to_string_lossy().into_owned());
                 if !dry_run {
                     self.discard(&path)?;
                 }
@@ -725,7 +854,11 @@ impl Repo {
                 // Entries are named `<name>-<nanos>`. Recent ones are still
                 // being deleted by their own background `rm`.
                 let name = e.file_name().to_string_lossy().into_owned();
-                let born = name.rsplit('-').next().and_then(|n| n.parse::<u128>().ok()).unwrap_or(0);
+                let born = name
+                    .rsplit('-')
+                    .next()
+                    .and_then(|n| n.parse::<u128>().ok())
+                    .unwrap_or(0);
                 if now_ns.saturating_sub(born) < 600 * 1_000_000_000 {
                     continue;
                 }
@@ -767,7 +900,12 @@ impl Repo {
         let workspaces: Vec<WsStatus> = all
             .into_iter()
             .filter(|(m, _)| only.is_none_or(|n| n == m.name))
-            .map(|(m, changed)| WsStatus { name: m.name, path: m.path, base: m.base, changed })
+            .map(|(m, changed)| WsStatus {
+                name: m.name,
+                path: m.path,
+                base: m.base,
+                changed,
+            })
             .collect();
         if let Some(n) = only
             && workspaces.is_empty()
@@ -775,7 +913,10 @@ impl Repo {
             bail!("no workspace named {n:?}");
         }
         let overlaps = by_path.into_iter().filter(|(_, v)| v.len() > 1).collect();
-        Ok(Status { workspaces, overlaps })
+        Ok(Status {
+            workspaces,
+            overlaps,
+        })
     }
 
     pub fn land(&self, o: &LandOpts) -> Result<Landed> {
@@ -784,10 +925,24 @@ impl Repo {
         if files.is_empty() {
             bail!("workspace {:?} has no changes", o.name);
         }
-        let branch = o.branch.clone().unwrap_or_else(|| format!("agent-ws/{}", o.name));
-        let existing = git::line(&self.root, &["rev-parse", "--verify", "--quiet", &format!("refs/heads/{branch}")]).ok();
+        let branch = o
+            .branch
+            .clone()
+            .unwrap_or_else(|| format!("agent-ws/{}", o.name));
+        let existing = git::line(
+            &self.root,
+            &[
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                &format!("refs/heads/{branch}"),
+            ],
+        )
+        .ok();
         let head = git::line(&m.path, &["rev-parse", "HEAD"])?;
-        let clean = git::run(&m.path, &["status", "--porcelain"])?.trim().is_empty();
+        let clean = git::run(&m.path, &["status", "--porcelain"])?
+            .trim()
+            .is_empty();
         // An earlier land created the branch at this workspace's HEAD and
         // stopped before removing the workspace: finish that land.
         let resume = existing.as_deref() == Some(head.as_str()) && clean && head != m.base;
@@ -802,11 +957,21 @@ impl Repo {
                     .args(["merge-base", "--is-ancestor", tip, &head])
                     .status()
                     .is_ok_and(|s| s.success());
-                let landed_by = git::line(&m.path, &["log", "-1", "--format=%(trailers:key=Agent-Ws,valueonly)", tip]);
+                let landed_by = git::line(
+                    &m.path,
+                    &[
+                        "log",
+                        "-1",
+                        "--format=%(trailers:key=Agent-Ws,valueonly)",
+                        tip,
+                    ],
+                );
                 ancestor && landed_by.is_ok_and(|n| n == o.name)
             });
         if existing.is_some() && !resume && !advance && !o.force_branch {
-            bail!("branch {branch} already exists and does not match this workspace; pass --branch NAME or --force-branch");
+            bail!(
+                "branch {branch} already exists and does not match this workspace; pass --branch NAME or --force-branch"
+            );
         }
         let mut overlaps: BTreeMap<String, Vec<String>> = BTreeMap::new();
         for (other, changed) in self.changes()? {
@@ -824,21 +989,41 @@ impl Repo {
             // so the branch tip carries the message and the trailers.
             let ws_trailer = format!("Agent-Ws: {}", o.name);
             let base_trailer = format!("Agent-Ws-Base: {}", m.base);
-            let mut args =
-                vec!["commit", "-q", "--allow-empty", "-m", &o.message, "--trailer", &ws_trailer, "--trailer", &base_trailer];
+            let mut args = vec![
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                &o.message,
+                "--trailer",
+                &ws_trailer,
+                "--trailer",
+                &base_trailer,
+            ];
             if o.no_verify {
                 args.push("--no-verify");
             }
             git::run(&m.path, &args)?;
             let commit = git::line(&m.path, &["rev-parse", "HEAD"])?;
-            let flag = if o.force_branch || advance { "-f" } else { "--no-track" };
+            let flag = if o.force_branch || advance {
+                "-f"
+            } else {
+                "--no-track"
+            };
             git::run(&self.root, &["branch", flag, &branch, &commit])?;
             commit
         };
         if !o.keep {
             self.drop(&o.name)?;
         }
-        Ok(Landed { name: o.name.clone(), branch, commit, files: files.len(), dropped: !o.keep, overlaps })
+        Ok(Landed {
+            name: o.name.clone(),
+            branch,
+            commit,
+            files: files.len(),
+            dropped: !o.keep,
+            overlaps,
+        })
     }
 
     /// Remove a workspace. The tree is renamed into `.trash` (instant) and
@@ -862,18 +1047,25 @@ fn isolate_submodules(ws_repo: &Path, src_repo: &Path, rev: &str) -> Result<()> 
     let tree = git::run(ws_repo, &["ls-tree", "-r", "-z", rev])?;
     // Entries look like `160000 commit <sha>\t<path>`.
     for entry in tree.split('\0').filter(|e| e.starts_with("160000 ")) {
-        let Some((head, rel)) = entry.split_once('\t') else { continue };
+        let Some((head, rel)) = entry.split_once('\t') else {
+            continue;
+        };
         let sha = head.rsplit(' ').next().unwrap_or_default();
         let (ws_sm, src_sm) = (ws_repo.join(rel), src_repo.join(rel));
         let dotgit = ws_sm.join(".git");
         // Not initialised in the source: nothing checked out to fix.
-        let Ok(md) = dotgit.symlink_metadata() else { continue };
+        let Ok(md) = dotgit.symlink_metadata() else {
+            continue;
+        };
         if md.is_file() {
             let raw = std::fs::read_to_string(&dotgit)?;
             let Some(gd) = raw.trim().strip_prefix("gitdir:").map(str::trim) else {
                 bail!("submodule {rel}: unexpected .git file");
             };
-            let gitdir = src_sm.join(gd).canonicalize().with_context(|| format!("submodule {rel}: git dir {gd} not found"))?;
+            let gitdir = src_sm
+                .join(gd)
+                .canonicalize()
+                .with_context(|| format!("submodule {rel}: git dir {gd} not found"))?;
             std::fs::remove_file(&dotgit)?;
             fsutil::clone_path(&gitdir, &dotgit)?;
             // The copy sits inside the tree it describes; the source's
@@ -881,7 +1073,10 @@ fn isolate_submodules(ws_repo: &Path, src_repo: &Path, rev: &str) -> Result<()> 
             // there (even `git -C <submodule> config`), so edit the config
             // file from a directory outside any repository.
             let config = dotgit.join("config").to_string_lossy().into_owned();
-            let _ = git::run(Path::new("/"), &["config", "--file", &config, "--unset", "core.worktree"]);
+            let _ = git::run(
+                Path::new("/"),
+                &["config", "--file", &config, "--unset", "core.worktree"],
+            );
         }
         git::run(&ws_sm, &["checkout", "-q", "-f", "--detach", sha])?;
         git::run(&ws_sm, &["clean", "-fdq"])?;
@@ -906,7 +1101,13 @@ fn process_start(pid: u32) -> Option<u64> {
     let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
     let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
     let got = unsafe {
-        libc::proc_pidinfo(pid as libc::c_int, libc::PROC_PIDTBSDINFO, 0, (&raw mut info).cast(), size)
+        libc::proc_pidinfo(
+            pid as libc::c_int,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            (&raw mut info).cast(),
+            size,
+        )
     };
     (got == size).then(|| info.pbi_start_tvsec * 1_000_000 + info.pbi_start_tvusec)
 }

@@ -7,7 +7,11 @@ use std::process::Command;
 pub fn run(dir: &Path, args: &[&str]) -> Result<String> {
     let out = Command::new("git").arg("-C").arg(dir).args(args).output()?;
     if !out.status.success() {
-        bail!("git {}: {}", args.join(" "), String::from_utf8_lossy(&out.stderr).trim());
+        bail!(
+            "git {}: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
     }
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
@@ -21,7 +25,16 @@ pub fn line(dir: &Path, args: &[&str]) -> Result<String> {
 /// another workspace edits is an overlap too.
 pub fn changed_paths(dir: &Path, base: &str) -> Result<Vec<String>> {
     let mut paths = Vec::new();
-    let out = run(dir, &["status", "--porcelain=v1", "-z", "--untracked-files=all", "--no-renames"])?;
+    let out = run(
+        dir,
+        &[
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+            "--no-renames",
+        ],
+    )?;
     let mut parts = out.split('\0').filter(|s| !s.is_empty());
     while let Some(entry) = parts.next() {
         if entry.len() > 3 {
@@ -32,7 +45,12 @@ pub fn changed_paths(dir: &Path, base: &str) -> Result<Vec<String>> {
         }
     }
     // Commits the agent made inside the workspace count as changes too.
-    for p in run(dir, &["diff", "--name-only", "--no-renames", "-z", base, "HEAD"])?.split('\0') {
+    for p in run(
+        dir,
+        &["diff", "--name-only", "--no-renames", "-z", base, "HEAD"],
+    )?
+    .split('\0')
+    {
         if !p.is_empty() {
             paths.push(p.to_string());
         }

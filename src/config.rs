@@ -6,7 +6,16 @@ use std::path::Path;
 
 pub const FILE: &str = ".agent-ws.toml";
 
-const SECRETS: &[&str] = &[".env", ".env.*", ".dev.vars", "*.pem", "*.key", "*.p12", "id_rsa", "id_ed25519"];
+const SECRETS: &[&str] = &[
+    ".env",
+    ".env.*",
+    ".dev.vars",
+    "*.pem",
+    "*.key",
+    "*.p12",
+    "id_rsa",
+    "id_ed25519",
+];
 const SECRETS_KEEP: &[&str] = &[".env.example", ".env.sample", ".env.template"];
 
 /// Files whose change makes pooled workspaces stale even when HEAD did not
@@ -55,13 +64,24 @@ impl Config {
     }
 
     pub fn is_secret(&self, name: &str) -> bool {
-        let pats = self.secrets.as_deref().map(own).unwrap_or_else(|| own_static(SECRETS));
-        let keep = self.secrets_keep.as_deref().map(own).unwrap_or_else(|| own_static(SECRETS_KEEP));
-        pats.iter().any(|p| crate::fsutil::glob(p, name)) && !keep.iter().any(|p| crate::fsutil::glob(p, name))
+        let pats = self
+            .secrets
+            .as_deref()
+            .map(own)
+            .unwrap_or_else(|| own_static(SECRETS));
+        let keep = self
+            .secrets_keep
+            .as_deref()
+            .map(own)
+            .unwrap_or_else(|| own_static(SECRETS_KEEP));
+        pats.iter().any(|p| crate::fsutil::glob(p, name))
+            && !keep.iter().any(|p| crate::fsutil::glob(p, name))
     }
 
     pub fn stamp_files(&self) -> Vec<String> {
-        self.pool_stamp.clone().unwrap_or_else(|| STAMP.iter().map(|s| s.to_string()).collect())
+        self.pool_stamp
+            .clone()
+            .unwrap_or_else(|| STAMP.iter().map(|s| s.to_string()).collect())
     }
 }
 

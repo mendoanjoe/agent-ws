@@ -29,7 +29,12 @@ pub fn clone_path(src: &Path, dst: &Path) -> Result<()> {
 /// Clone the children of `src` into the existing directory `dst`, skipping
 /// `excludes` (paths relative to the root). A directory that only contains an
 /// excluded path is recreated and its other children cloned one by one.
-pub fn clone_tree(src_root: &Path, dst_root: &Path, rel: &Path, excludes: &[PathBuf]) -> Result<usize> {
+pub fn clone_tree(
+    src_root: &Path,
+    dst_root: &Path,
+    rel: &Path,
+    excludes: &[PathBuf],
+) -> Result<usize> {
     let mut calls = 0;
     let dir = src_root.join(rel);
     for entry in std::fs::read_dir(&dir).with_context(|| format!("read {}", dir.display()))? {
@@ -58,7 +63,11 @@ pub fn free_bytes(path: &Path) -> Result<u64> {
     let c = cstr(path)?;
     let mut s: libc::statvfs = unsafe { std::mem::zeroed() };
     if unsafe { libc::statvfs(c.as_ptr(), &mut s) } != 0 {
-        bail!("statvfs {}: {}", path.display(), std::io::Error::last_os_error());
+        bail!(
+            "statvfs {}: {}",
+            path.display(),
+            std::io::Error::last_os_error()
+        );
     }
     Ok(s.f_bavail as u64 * s.f_frsize as u64)
 }
@@ -138,7 +147,9 @@ pub fn scan(
                     relink(&p, &meant)?;
                     found.external.push((rel, meant));
                 }
-            } else if is_secret(&name.to_string_lossy()) && !tracked.contains(&*rel.to_string_lossy()) {
+            } else if is_secret(&name.to_string_lossy())
+                && !tracked.contains(&*rel.to_string_lossy())
+            {
                 std::fs::remove_file(&p)?;
                 found.secrets.push(rel.to_string_lossy().into_owned());
             }
