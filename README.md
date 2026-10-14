@@ -14,6 +14,7 @@ agent-ws status                   # changed files per workspace + OVERLAP warnin
 agent-ws land a1 -m "feat: ..."   # commit to branch agent-ws/a1, remove workspace
 agent-ws drop a1                  # remove without landing (instant)
 agent-ws list
+agent-ws gc                       # clean up after crashes (--dry-run to preview)
 ```
 
 Every command accepts `--json`.
@@ -37,6 +38,16 @@ Every command accepts `--json`.
   and keeps the workspace when it fails.
 - `drop` renames the tree into `.trash` and deletes it in the background.
 - Spawning stops below 2 GB of free disk (`--min-free-gb`).
+
+## Many agents at once
+
+- Spawn, land and drop are safe to run in parallel. A spawn claims its name
+  first, so two agents asking for the same name get exactly one workspace.
+- Clones contend for the same disk: 8 parallel spawns of a 2.7k-file repo
+  with 700 packages finish in ~4.4 s wall time (~1 s each when sequential).
+- `gc` removes spawns whose process died, records of folders deleted by hand,
+  folders with no record and trash older than 10 minutes. It never touches a
+  spawn whose process is still alive.
 
 ## Storage
 

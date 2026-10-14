@@ -3,6 +3,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 struct Env {
     _tmp: tempfile::TempDir,
@@ -191,4 +192,105 @@ fn works_from_inside_a_workspace() {
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     let l: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(l[0]["name"], "w1");
+}
+
+#[test]
+fn parallel_spawns_all_succeed() {
+    let e = Env::new();
+    let outs: Vec<Output> = std::thread::scope(|s| {
+        let hs: Vec<_> = (0..8).map(|i| {
+            let e = &e;
+            s.spawn(move || e.run(&["--json", "spawn", &format!("p{i}")]))
+        }).collect();
+        hs.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    for o in &outs {
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    }
+    assert_eq!(e.ok(&["list"]).as_array().unwrap().len(), 8);
+    assert_eq!(git(&e.repo, &["worktree", "list"]).lines().count(), 9);
+    // Landing and dropping in parallel leaves nothing behind.
+    std::thread::scope(|s| {
+        for i in 0..8 {
+            let e = &e;
+            s.spawn(move || {
+                let name = format!("p{i}");
+                if i % 2 == 0 {
+                    let ws = PathBuf::from(e.ok(&["path", &name])["path"].as_str().unwrap());
+                    fs::write(ws.join(format!("f{i}.txt")), "x").unwrap();
+                    e.ok(&["land", &name, "-m", "x"]);
+                } else {
+                    e.ok(&["drop", &name]);
+                }
+            });
+        }
+    });
+    assert_eq!(e.ok(&["list"]), serde_json::json!([]));
+    assert_eq!(git(&e.repo, &["worktree", "list"]).lines().count(), 1);
+    assert_eq!(git(&e.repo, &["branch", "--list", "agent-ws/*"]).lines().count(), 4);
+}
+
+#[test]
+fn same_name_race_has_one_winner() {
+    let e = Env::new();
+    let outs: Vec<Output> = std::thread::scope(|s| {
+        let hs: Vec<_> = (0..6).map(|_| {
+            let e = &e;
+            s.spawn(move || e.run(&["spawn", "dup"]))
+        }).collect();
+        hs.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    assert_eq!(outs.iter().filter(|o| o.status.success()).count(), 1);
+    assert_eq!(e.ok(&["list"]).as_array().unwrap().len(), 1);
+    assert_eq!(git(&e.repo, &["worktree", "list"]).lines().count(), 2);
+}
+
+#[test]
+fn gc_cleans_crashes_but_not_live_spawns() {
+    let e = Env::new();
+    let keep = PathBuf::from(e.ok(&["spawn", "keep"])["path"].as_str().unwrap());
+    let dir = keep.parent().unwrap().parent().unwrap().to_path_buf();
+    let set_meta = |name: &str, state: &str, pid: u32| {
+        let p = dir.join("meta").join(format!("{name}.json"));
+        let mut m: serde_json::Value = serde_json::from_slice(&fs::read(&p).unwrap()).unwrap();
+        m["state"] = state.into();
+        m["pid"] = pid.into();
+        fs::write(p, serde_json::to_vec(&m).unwrap()).unwrap();
+    };
+    // Spawn that died midway: record says creating, process is gone.
+    let crashed = PathBuf::from(e.ok(&["spawn", "crashed"])["path"].as_str().unwrap());
+    set_meta("crashed", "creating", 999_999);
+    // Spawn still running in another process (this test process is alive).
+    let live = PathBuf::from(e.ok(&["spawn", "live"])["path"].as_str().unwrap());
+    set_meta("live", "creating", std::process::id());
+    // Folder deleted by hand.
+    let gone = PathBuf::from(e.ok(&["spawn", "gone"])["path"].as_str().unwrap());
+    fs::remove_dir_all(&gone).unwrap();
+    // Folder with no record, and a leftover in the trash.
+    fs::create_dir(dir.join("ws/orphan")).unwrap();
+    fs::create_dir_all(dir.join(".trash/leftover-1000/x")).unwrap();
+    // A delete that started just now is not a leftover.
+    let recent = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+    fs::create_dir_all(dir.join(format!(".trash/fresh-{recent}"))).unwrap();
+
+    assert!(e.err(&["land", "live", "-m", "x"]).contains("still being created"));
+    let dry = e.ok(&["gc", "--dry-run"]);
+    assert_eq!(dry["interrupted"], serde_json::json!(["crashed"]));
+    assert_eq!(dry["missing"], serde_json::json!(["gone"]));
+    assert_eq!(dry["orphans"], serde_json::json!(["orphan"]));
+    assert_eq!(dry["trash"], 1);
+    assert!(crashed.exists() && dir.join("ws/orphan").exists(), "dry run changes nothing");
+
+    e.ok(&["gc"]);
+    assert!(!crashed.exists() && !dir.join("ws/orphan").exists());
+    assert!(live.exists() && keep.exists(), "live spawn and ready workspace survive");
+    let names: Vec<String> = e.ok(&["list"]).as_array().unwrap().iter().map(|m| m["name"].as_str().unwrap().to_string()).collect();
+    assert_eq!(names, ["keep"]);
+    let wt = git(&e.repo, &["worktree", "list"]);
+    assert!(wt.contains("keep") && wt.contains("live") && !wt.contains("crashed") && !wt.contains("gone"));
+    // The names are free again.
+    e.ok(&["spawn", "crashed"]);
+    e.ok(&["spawn", "gone"]);
+    let again = e.ok(&["gc"]);
+    assert_eq!(again["interrupted"], serde_json::json!([]));
 }

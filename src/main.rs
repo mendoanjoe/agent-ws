@@ -57,6 +57,12 @@ enum Cmd {
     },
     /// Remove a workspace without landing it.
     Drop { name: String },
+    /// Clean up after interrupted spawns, deleted folders and stale trash.
+    Gc {
+        /// Report only; change nothing.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 fn print<T: serde::Serialize>(json: bool, v: &T, human: impl FnOnce(&T)) -> Result<()> {
@@ -112,8 +118,8 @@ fn run(cli: Cli) -> Result<()> {
             }
         }),
         Cmd::Path { name } => {
-            println!("{}", repo.meta(&name)?.path.display());
-            Ok(())
+            let path = repo.meta(&name)?.path;
+            print(cli.json, &serde_json::json!({ "path": path }), |_| println!("{}", path.display()))
         }
         Cmd::Land { name, message, branch, force_branch, keep, no_verify } => {
             let l = repo.land(&LandOpts { name, message, branch, force_branch, keep, no_verify })?;
@@ -121,6 +127,24 @@ fn run(cli: Cli) -> Result<()> {
                 println!("{} -> {} {} ({} files){}", l.name, l.branch, &l.commit[..12], l.files, if l.dropped { ", dropped" } else { "" });
             })
         }
+        Cmd::Gc { dry_run } => print(cli.json, &repo.gc(dry_run)?, |g| {
+            let verb = if dry_run { "would remove" } else { "removed" };
+            for n in &g.interrupted {
+                println!("{verb} interrupted spawn {n}");
+            }
+            for n in &g.missing {
+                println!("{verb} record of deleted workspace {n}");
+            }
+            for n in &g.orphans {
+                println!("{verb} orphan folder {n}");
+            }
+            if g.trash > 0 {
+                println!("{verb} {} trash entries", g.trash);
+            }
+            if g.interrupted.is_empty() && g.missing.is_empty() && g.orphans.is_empty() && g.trash == 0 {
+                println!("nothing to clean");
+            }
+        }),
         Cmd::Drop { name } => {
             repo.drop(&name)?;
             print(cli.json, &serde_json::json!({ "dropped": name }), |_| println!("dropped {name}"))

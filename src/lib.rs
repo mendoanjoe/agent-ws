@@ -28,8 +28,31 @@ pub struct Repo {
 pub struct Meta {
     pub name: String,
     pub path: PathBuf,
+    /// Empty while the workspace is being created.
     pub base: String,
     pub created: u64,
+    /// `creating` until spawn finishes, then `ready`.
+    #[serde(default = "ready")]
+    pub state: String,
+    /// Process that is creating the workspace (0 once ready).
+    #[serde(default)]
+    pub pid: u32,
+}
+
+fn ready() -> String {
+    "ready".into()
+}
+
+#[derive(Serialize, Default)]
+pub struct Gc {
+    /// Workspaces whose spawn died midway.
+    pub interrupted: Vec<String>,
+    /// Workspaces whose directory was deleted by hand.
+    pub missing: Vec<String>,
+    /// Directories under `ws/` with no workspace record.
+    pub orphans: Vec<String>,
+    /// Leftovers in `.trash` from interrupted background deletes.
+    pub trash: usize,
 }
 
 #[derive(Serialize)]
@@ -142,20 +165,56 @@ impl Repo {
     pub fn meta(&self, name: &str) -> Result<Meta> {
         let p = self.meta_path(name);
         let raw = std::fs::read(&p).with_context(|| format!("no workspace named {name:?}"))?;
-        Ok(serde_json::from_slice(&raw)?)
+        let m: Meta = serde_json::from_slice(&raw)?;
+        if m.state != "ready" {
+            bail!("workspace {name:?} is still being created (run `agent-ws gc` if its spawn died)");
+        }
+        Ok(m)
     }
 
+    /// Workspaces that finished spawning.
     pub fn list(&self) -> Result<Vec<Meta>> {
+        Ok(self.records()?.into_iter().filter(|m| m.state == "ready").collect())
+    }
+
+    /// All workspace records, including ones still being created.
+    fn records(&self) -> Result<Vec<Meta>> {
         let mut out = Vec::new();
         let Ok(rd) = std::fs::read_dir(self.dir.join("meta")) else { return Ok(out) };
         for e in rd {
             let p = e?.path();
             if p.extension().and_then(|x| x.to_str()) == Some("json") {
-                out.push(serde_json::from_slice(&std::fs::read(&p)?)?);
+                // A record can vanish between read_dir and read when another
+                // process drops it.
+                let Ok(raw) = std::fs::read(&p) else { continue };
+                out.push(serde_json::from_slice(&raw)?);
             }
         }
         out.sort_by(|a: &Meta, b| a.name.cmp(&b.name));
         Ok(out)
+    }
+
+    fn write_meta(&self, m: &Meta, create_new: bool) -> Result<()> {
+        let p = self.meta_path(&m.name);
+        let raw = serde_json::to_vec_pretty(m)?;
+        if create_new {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&p)
+                .map_err(|e| match e.kind() {
+                    std::io::ErrorKind::AlreadyExists => anyhow::anyhow!("workspace {:?} already exists", m.name),
+                    _ => e.into(),
+                })?;
+            f.write_all(&raw)?;
+        } else {
+            // Write then rename so readers never see a half-written record.
+            let tmp = p.with_extension(format!("json.{}", std::process::id()));
+            std::fs::write(&tmp, raw)?;
+            std::fs::rename(tmp, p)?;
+        }
+        Ok(())
     }
 
     fn prepare_home(&self) -> Result<()> {
@@ -183,13 +242,38 @@ impl Repo {
     pub fn spawn(&self, o: &SpawnOpts) -> Result<Spawned> {
         let t0 = Instant::now();
         check_name(&o.name)?;
-        if self.meta_path(&o.name).exists() {
-            bail!("workspace {:?} already exists", o.name);
-        }
         self.prepare_home()?;
         let path = self.dir.join("ws").join(&o.name);
+        // Claim the name first: the record marks the directory as in use, so
+        // `gc` leaves it alone while the owning process is alive.
+        let mut meta = Meta {
+            name: o.name.clone(),
+            path: path.clone(),
+            base: String::new(),
+            created: now(),
+            state: "creating".into(),
+            pid: std::process::id(),
+        };
+        self.write_meta(&meta, true)?;
+        let result = self.create(o, &path, t0);
+        match result {
+            Ok(s) => {
+                meta.base = s.base.clone();
+                meta.state = ready();
+                meta.pid = 0;
+                self.write_meta(&meta, false)?;
+                Ok(s)
+            }
+            Err(e) => {
+                let _ = std::fs::remove_file(self.meta_path(&o.name));
+                Err(e)
+            }
+        }
+    }
+
+    fn create(&self, o: &SpawnOpts, path: &Path, t0: Instant) -> Result<Spawned> {
         if path.exists() {
-            bail!("{} already exists; run `agent-ws drop {}`", path.display(), o.name);
+            bail!("{} already exists; run `agent-ws gc`", path.display());
         }
         if fsutil::device(&self.root)? != fsutil::device(&self.dir)? {
             bail!(
@@ -207,14 +291,12 @@ impl Repo {
 
         let p = path.to_string_lossy().to_string();
         git::run(&self.root, &["worktree", "add", "--no-checkout", "--detach", &p, &base])?;
-        let result = self.fill(o, &path);
+        let result = self.fill(o, path);
         match result {
             Ok((clone_ms, clone_calls, symlinks, secrets)) => {
-                let meta = Meta { name: o.name.clone(), path: path.clone(), base: base.clone(), created: now() };
-                std::fs::write(self.meta_path(&o.name), serde_json::to_vec_pretty(&meta)?)?;
                 Ok(Spawned {
                     name: o.name.clone(),
-                    path,
+                    path: path.to_path_buf(),
                     base,
                     clone_ms,
                     total_ms: t0.elapsed().as_millis(),
@@ -229,12 +311,81 @@ impl Repo {
                 })
             }
             Err(e) => {
-                let _ = git::run(&self.root, &["worktree", "remove", "--force", &p]);
-                let _ = std::fs::remove_dir_all(&path);
-                let _ = git::run(&self.root, &["worktree", "prune"]);
+                let _ = self.discard(path);
                 Err(e)
             }
         }
+    }
+
+    /// Move a workspace tree into `.trash`, delete it in the background and
+    /// forget its worktree registration.
+    fn discard(&self, path: &Path) -> Result<()> {
+        if path.exists() {
+            let nanos = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("ws");
+            let trash = self.dir.join(".trash").join(format!("{name}-{nanos}"));
+            std::fs::create_dir_all(self.dir.join(".trash"))?;
+            std::fs::rename(path, &trash)?;
+            delete_in_background(&trash)?;
+        }
+        git::run(&self.root, &["worktree", "prune"])?;
+        Ok(())
+    }
+
+    /// Clean up after crashes and manual deletes. Never touches a workspace
+    /// whose spawning process is still alive.
+    pub fn gc(&self, dry_run: bool) -> Result<Gc> {
+        let mut report = Gc::default();
+        let mut known = std::collections::HashSet::new();
+        for m in self.records()? {
+            known.insert(m.name.clone());
+            let dead = m.state != "ready" && !pid_alive(m.pid);
+            let missing = m.state == "ready" && !m.path.exists();
+            if !(dead || missing) {
+                continue;
+            }
+            if dead { report.interrupted.push(m.name.clone()) } else { report.missing.push(m.name.clone()) }
+            if !dry_run {
+                self.discard(&m.path)?;
+                let _ = std::fs::remove_file(self.meta_path(&m.name));
+            }
+        }
+        if let Ok(rd) = std::fs::read_dir(self.dir.join("ws")) {
+            for e in rd {
+                let e = e?;
+                let name = e.file_name().to_string_lossy().into_owned();
+                // Re-check the record: a spawn may have claimed it after the scan.
+                if known.contains(&name) || self.meta_path(&name).exists() {
+                    continue;
+                }
+                report.orphans.push(name);
+                if !dry_run {
+                    self.discard(&e.path())?;
+                }
+            }
+        }
+        if let Ok(rd) = std::fs::read_dir(self.dir.join(".trash")) {
+            let now_ns = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+            for e in rd {
+                let e = e?;
+                // Entries are named `<name>-<nanos>`. Recent ones are still
+                // being deleted by their own background `rm`.
+                let name = e.file_name().to_string_lossy().into_owned();
+                let born = name.rsplit('-').next().and_then(|n| n.parse::<u128>().ok()).unwrap_or(0);
+                if now_ns.saturating_sub(born) < 600 * 1_000_000_000 {
+                    continue;
+                }
+                report.trash += 1;
+                if !dry_run {
+                    delete_in_background(&e.path())?;
+                }
+            }
+        }
+        if !dry_run && self.dir.exists() {
+            git::run(&self.root, &["worktree", "prune"])?;
+        }
+        report.orphans.sort();
+        Ok(report)
     }
 
     /// Clone the checkout into `path`, then make its tracked files equal the
@@ -276,6 +427,10 @@ impl Repo {
         let mut all = Vec::new();
         let mut by_path: BTreeMap<String, Vec<String>> = BTreeMap::new();
         for m in self.list()? {
+            // Deleted by hand; `agent-ws gc` reports and forgets it.
+            if !m.path.exists() {
+                continue;
+            }
             let changed = git::changed_paths(&m.path, &m.base)?;
             for p in &changed {
                 by_path.entry(p.clone()).or_default().push(m.name.clone());
@@ -330,21 +485,27 @@ impl Repo {
     /// deleted by a detached `rm -rf`, which takes seconds for large trees.
     pub fn drop(&self, name: &str) -> Result<()> {
         let m = self.meta(name)?;
-        if m.path.exists() {
-            let nanos = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
-            let trash = self.dir.join(".trash").join(format!("{name}-{nanos}"));
-            std::fs::create_dir_all(self.dir.join(".trash"))?;
-            std::fs::rename(&m.path, &trash)?;
-            std::process::Command::new("rm")
-                .arg("-rf")
-                .arg(&trash)
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .spawn()?;
-        }
-        git::run(&self.root, &["worktree", "prune"])?;
+        self.discard(&m.path)?;
         std::fs::remove_file(self.meta_path(name))?;
         Ok(())
     }
+}
+
+fn delete_in_background(path: &Path) -> Result<()> {
+    std::process::Command::new("rm")
+        .arg("-rf")
+        .arg(path)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()?;
+    Ok(())
+}
+
+fn pid_alive(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    // Signal 0 checks existence; EPERM means it exists under another user.
+    unsafe { libc::kill(pid as libc::pid_t, 0) == 0 || *libc::__error() == libc::EPERM }
 }
