@@ -41,6 +41,9 @@ const TRASH_GRACE_NS: u128 = 600 * 1_000_000_000;
 /// `prune` leaves workspaces younger than this alone by default.
 pub const PRUNE_MIN_AGE_SECS: u64 = 3600;
 
+/// The background prune after `spawn` runs at most this often.
+const AUTO_PRUNE_EVERY_SECS: u64 = 600;
+
 pub struct Repo {
     /// Main checkout of the repository.
     pub root: PathBuf,
@@ -134,6 +137,9 @@ pub struct PruneOpts {
     pub gh: bool,
     /// Leave workspaces created less than this many seconds ago.
     pub min_age_secs: u64,
+    /// Keep `unused` workspaces too (the automatic prune after `spawn`):
+    /// a coordinator may have spawned one for later.
+    pub merged_only: bool,
 }
 
 #[derive(Serialize)]
@@ -174,8 +180,14 @@ pub struct Gc {
     pub interrupted: Vec<String>,
     /// Records whose directory was deleted by hand.
     pub missing: Vec<String>,
-    /// Directories under `ws/` with no record.
+    /// Directories under `ws/` with no record and no work in them, removed.
     pub orphans: Vec<String>,
+    /// Orphan directories with uncommitted changes or commits no branch
+    /// holds: registered again (base: fork point with the prune base), so
+    /// `list`, `land` and `drop` see them.
+    pub adopted: Vec<String>,
+    /// Orphan directories whose state Git cannot read: left alone.
+    pub unreadable: Vec<String>,
     /// Pool claims whose process died.
     pub claims: usize,
     /// Leftovers in `.trash` from interrupted background deletes.
@@ -922,9 +934,27 @@ impl Repo {
                 } {
                     continue;
                 }
-                report
-                    .orphans
-                    .push(e.file_name().to_string_lossy().into_owned());
+                let name = e.file_name().to_string_lossy().into_owned();
+                // A named folder can hold an agent's work (its record was
+                // lost or deleted by hand): register it again, never delete.
+                // Pool folders never had an agent in them.
+                if !name.starts_with(POOL_PREFIX) {
+                    match self.orphan_work(&path) {
+                        Err(_) => {
+                            report.unreadable.push(name);
+                            continue;
+                        }
+                        Ok(Some(base)) => {
+                            if !dry_run {
+                                self.adopt(&name, &path, &base)?;
+                            }
+                            report.adopted.push(name);
+                            continue;
+                        }
+                        Ok(None) => {}
+                    }
+                }
+                report.orphans.push(name);
                 if !dry_run {
                     self.discard(&path)?;
                 }
@@ -935,8 +965,92 @@ impl Repo {
             git::run(&self.root, &["worktree", "prune"])?;
         }
         report.orphans.sort();
+        report.adopted.sort();
+        report.unreadable.sort();
         report.corrupt.sort();
         Ok(report)
+    }
+
+    /// Whether an orphan workspace folder holds work: uncommitted changes,
+    /// or a HEAD that no branch, remote branch or tag contains. Returns the
+    /// base to register it with, `None` when deleting it loses nothing, and
+    /// an error when Git cannot read it (then nobody should delete it).
+    fn orphan_work(&self, path: &Path) -> Result<Option<String>> {
+        // Without its own `.git`, Git would answer for an enclosing
+        // repository. Only an empty folder is safe to remove then.
+        if path.join(".git").symlink_metadata().is_err() {
+            if std::fs::read_dir(path)?.next().is_none() {
+                return Ok(None);
+            }
+            bail!("not a Git worktree");
+        }
+        let head = git::line(path, &["rev-parse", "--verify", "HEAD^{commit}"])?;
+        // The folder must really be a worktree of this repository, not a
+        // nested repository that answers for itself.
+        let common = git::line(
+            path,
+            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        )?;
+        if Path::new(&common) != self.root.join(".git") {
+            bail!("not a worktree of this repository");
+        }
+        let dirty = !git::run(path, &["--no-optional-locks", "status", "--porcelain"])?
+            .trim()
+            .is_empty();
+        let unreachable = !git::line(
+            &self.root,
+            &[
+                "rev-list",
+                "-1",
+                &head,
+                "--not",
+                "--branches",
+                "--remotes",
+                "--tags",
+            ],
+        )?
+        .is_empty();
+        if !(dirty || unreachable) {
+            return Ok(None);
+        }
+        let base = self
+            .prune_base()
+            .ok()
+            .and_then(|b| git::line(&self.root, &["merge-base", &head, &b]).ok())
+            .unwrap_or(head);
+        Ok(Some(base))
+    }
+
+    /// Write a ready record for an existing workspace folder.
+    fn adopt(&self, name: &str, path: &Path, base: &str) -> Result<()> {
+        let meta = Meta {
+            name: name.into(),
+            path: path.to_path_buf(),
+            base: base.into(),
+            created: now(),
+            state: ready(),
+            pid: 0,
+            pid_start: 0,
+            key: String::new(),
+            notes: Notes::default(),
+        };
+        write_record(&self.meta_path(name), &meta, true)
+    }
+
+    /// Whether the background prune after `spawn` should run now: enabled
+    /// (`auto_prune`, default on) and not run in the last 10 minutes.
+    /// Marks it as run.
+    pub fn auto_prune_due(&self) -> bool {
+        if self.config.auto_prune == Some(false) {
+            return false;
+        }
+        let stamp = self.dir.join("auto-prune.stamp");
+        let recent = std::fs::metadata(&stamp)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|age| age.as_secs() < AUTO_PRUNE_EVERY_SECS);
+        !recent && std::fs::write(&stamp, b"").is_ok()
     }
 
     /// Restart the delete of trash entries whose background `rm` died (older
@@ -1154,6 +1268,9 @@ impl Repo {
                 continue;
             };
             match self.merged_reason(&m, &head, &base_commit, o.gh) {
+                Some(reason) if o.merged_only && reason == "unused" => {
+                    kept.push(keep("unused since spawn".into()))
+                }
                 Some(reason) => pruned.push(Pruned {
                     name: m.name.clone(),
                     path: m.path.clone(),

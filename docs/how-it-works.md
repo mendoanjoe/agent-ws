@@ -166,6 +166,13 @@ every process of the user.
   (a later process that got the same pid does not count as alive), records of
   folders deleted by hand, folders with no record, and trash older than
   10 minutes. It never touches work whose process is still alive.
+- A folder with no record is deleted only if it holds no work. With
+  uncommitted changes, or a HEAD that no branch, remote branch or tag
+  contains, it gets a new record (base: its fork point with the prune base).
+  A folder Git cannot read is left alone, except an empty one.
+- After each `spawn` a detached `prune --merged-only` runs, at most every
+  10 minutes (`auto-prune.stamp`), unless `auto_prune = false`. It applies
+  the same checks as `prune` but keeps `unused` workspaces.
 
 ## Storage
 

@@ -81,6 +81,9 @@ enum Cmd {
         /// Leave workspaces younger than this many minutes.
         #[arg(long, default_value_t = agent_ws::PRUNE_MIN_AGE_SECS / 60)]
         min_age_min: u64,
+        /// Keep workspaces that were never used (the automatic prune).
+        #[arg(long, hide = true)]
+        merged_only: bool,
     },
     /// Real disk use per workspace: bytes not shared with any other file.
     Du { name: Option<String> },
@@ -158,6 +161,25 @@ fn refill_in_background(repo: &Repo) {
     }
 }
 
+/// Drop merged workspaces in a detached process, at most every 10 minutes,
+/// so forgotten ones do not pile up. Never-used workspaces stay.
+fn prune_in_background(repo: &Repo) {
+    if std::env::var_os("AGENT_WS_NO_AUTO_PRUNE").is_some() || !repo.auto_prune_due() {
+        return;
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        use std::os::unix::process::CommandExt;
+        let _ = std::process::Command::new(exe)
+            .args(["prune", "--merged-only"])
+            .current_dir(&repo.root)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .process_group(0)
+            .spawn();
+    }
+}
+
 fn run(cli: Cli) -> Result<()> {
     let repo = Repo::discover(&std::env::current_dir()?)?;
     match cli.cmd {
@@ -179,6 +201,7 @@ fn run(cli: Cli) -> Result<()> {
             };
             let s = repo.spawn(&opts)?;
             refill_in_background(&repo);
+            prune_in_background(&repo);
             print(cli.json, &s, |s| {
                 println!("{}  {}", s.name, s.path.display());
                 let how = if s.from_pool {
@@ -274,6 +297,19 @@ fn run(cli: Cli) -> Result<()> {
             for n in &g.orphans {
                 println!("{verb} orphan folder {n}");
             }
+            for n in &g.adopted {
+                let how = if dry_run {
+                    "would register"
+                } else {
+                    "registered"
+                };
+                println!(
+                    "{how} orphan folder {n} again: it holds work (see `agent-ws status {n}`)"
+                );
+            }
+            for n in &g.unreadable {
+                println!("left orphan folder {n}: Git cannot read it; check it by hand");
+            }
             if g.claims > 0 {
                 println!("{verb} {} dead pool claims", g.claims);
             }
@@ -283,6 +319,8 @@ fn run(cli: Cli) -> Result<()> {
             if g.interrupted.is_empty()
                 && g.missing.is_empty()
                 && g.orphans.is_empty()
+                && g.adopted.is_empty()
+                && g.unreadable.is_empty()
                 && g.claims == 0
                 && g.trash == 0
             {
@@ -294,6 +332,7 @@ fn run(cli: Cli) -> Result<()> {
             dry_run,
             gh,
             min_age_min,
+            merged_only,
         } => print(
             cli.json,
             &repo.prune(&PruneOpts {
@@ -301,6 +340,7 @@ fn run(cli: Cli) -> Result<()> {
                 dry_run,
                 gh,
                 min_age_secs: min_age_min * 60,
+                merged_only,
             })?,
             |p| {
                 let verb = if dry_run { "would drop" } else { "dropped" };

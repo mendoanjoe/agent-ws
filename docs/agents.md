@@ -170,7 +170,17 @@ agent-ws gc --dry-run    # show what would be removed
 agent-ws gc              # remove workspaces whose process died
 ```
 
-`gc` never touches a workspace whose process is still alive.
+`gc` never touches a workspace whose process is still alive, and registers a
+folder that lost its record but still holds work instead of deleting it.
+
+## After a merge
+
+```sh
+git fetch && agent-ws prune --dry-run && agent-ws prune
+```
+
+`spawn` also prunes merged workspaces in the background, so forgotten ones
+do not pile up.
 
 ## Notes
 

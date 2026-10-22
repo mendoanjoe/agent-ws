@@ -55,6 +55,8 @@ pub struct Config {
     pub prune_base: Option<String>,
     /// `spawn` warns once this many workspaces exist (default 20, 0 = never).
     pub warn_workspaces: Option<usize>,
+    /// After `spawn`, drop merged workspaces in the background (default on).
+    pub auto_prune: Option<bool>,
 }
 
 impl Config {

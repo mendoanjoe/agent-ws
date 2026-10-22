@@ -149,8 +149,17 @@ process (an agent, a shell) has as its current directory. The base is
 `--base`, else `prune_base` from the config, else `origin/HEAD`,
 `origin/main`, `origin/master`, `main` or `master`, the first that exists.
 
+If you forget: every `spawn` also starts a background prune, at most once
+per 10 minutes. It drops merged workspaces only and leaves never-used ones,
+since a coordinator may have spawned those for later. Turn it off with
+`auto_prune = false`.
+
 `spawn` warns from 20 workspaces and below 10 GB free disk. See
 [docs/disk-usage.md](docs/disk-usage.md) for measurements.
+
+`gc` never deletes a workspace folder that has lost its record but still
+holds work (uncommitted changes, or commits no branch contains). It
+registers the folder again, so you can `land` or `drop` it.
 
 ## Pool
 
@@ -174,6 +183,7 @@ pool = 4                        # default pool size; `pool set` overrides it
 pool_stamp = ["pnpm-lock.yaml"] # files whose change makes pooled workspaces stale
 prune_base = "origin/develop"   # branch `prune` compares against
 warn_workspaces = 30            # spawn warns from this many workspaces (0 = never)
+auto_prune = false              # no background prune after spawn (default on)
 ```
 
 Unknown keys are an error. Workspaces and state live in

@@ -74,6 +74,11 @@ even if all of it came from those workspaces, that is about 100 MB each.
   restarts deletes older than 10 minutes.
 - The pool is capped at 8.
 - `spawn` warns from 20 workspaces (`warn_workspaces`) and below 10 GB free.
+- `spawn` prunes merged workspaces in the background (`auto_prune`), so a
+  forgotten `prune` no longer lets them pile up.
+- `gc` no longer deletes record-less folders that hold work. On the real
+  home it would have deleted `s0803f-it` (247 uncommitted changes, one
+  commit not in `origin/main`); now it registers it again.
 
 No cache exclude list was added: nothing in the measurement was a re-copied
 cache. If a repository has one, list it in `exclude` in `.agent-ws.toml`.

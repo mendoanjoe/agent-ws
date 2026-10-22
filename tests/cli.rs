@@ -82,6 +82,7 @@ impl Env {
             .env("AGENT_WS_HOME", &self.home)
             // Background refills would race with the assertions.
             .env("AGENT_WS_NO_REFILL", "1")
+            .env("AGENT_WS_NO_AUTO_PRUNE", "1")
             .args(args)
             .output()
             .unwrap()
@@ -1104,4 +1105,95 @@ fn p3_pool_is_capped_and_spawn_warns() {
     );
     let human = String::from_utf8(e.run(&["spawn", "three"]).stdout).unwrap();
     assert!(human.contains("WARNING 3 workspaces exist"), "{human}");
+}
+
+#[test]
+fn p4_gc_registers_orphans_that_hold_work_instead_of_deleting_them() {
+    let e = Env::new();
+    let dirty = path_of(&e.ok(&["spawn", "dirty"]));
+    fs::write(dirty.join("a.txt"), "unsaved\n").unwrap();
+    // Commits on a detached HEAD live nowhere else.
+    let detached = path_of(&e.ok(&["spawn", "detached"]));
+    fs::write(detached.join("f.txt"), "eff\n").unwrap();
+    git(&detached, &["add", "-A"]);
+    git(&detached, &["commit", "-q", "-m", "f"]);
+    let clean = path_of(&e.ok(&["spawn", "clean"]));
+    let dir = home_dir(&e);
+    for n in ["dirty", "detached", "clean"] {
+        fs::remove_file(dir.join(format!("meta/{n}.json"))).unwrap();
+    }
+    fs::create_dir(dir.join("ws/notgit")).unwrap();
+    fs::write(dir.join("ws/notgit/notes.txt"), "keep me").unwrap();
+
+    let dry = e.ok(&["gc", "--dry-run"]);
+    assert_eq!(dry["adopted"], serde_json::json!(["detached", "dirty"]));
+    assert_eq!(dry["orphans"], serde_json::json!(["clean"]));
+    assert_eq!(dry["unreadable"], serde_json::json!(["notgit"]));
+    assert!(e.ok(&["list"]).as_array().unwrap().is_empty());
+
+    e.ok(&["gc"]);
+    assert!(!clean.exists());
+    assert!(dirty.exists() && detached.exists() && dir.join("ws/notgit/notes.txt").exists());
+    let st = e.ok(&["status", "dirty"]);
+    assert_eq!(st["workspaces"][0]["changed"], serde_json::json!(["a.txt"]));
+    let landed = e.ok(&["land", "detached", "-m", "rescued"]);
+    assert_eq!(landed["files"], 1);
+    assert_eq!(
+        git(&e.repo, &["show", "agent-ws/detached:f.txt"]),
+        "eff",
+        "the rescued commit reached a branch"
+    );
+}
+
+#[test]
+fn p5_spawn_prunes_merged_workspaces_in_the_background() {
+    let e = Env::new();
+    let age = |name: &str| {
+        let p = home_dir(&e).join(format!("meta/{name}.json"));
+        let mut m: serde_json::Value = serde_json::from_slice(&fs::read(&p).unwrap()).unwrap();
+        m["created"] = 0.into();
+        fs::write(p, serde_json::to_vec(&m).unwrap()).unwrap();
+    };
+    let merged = path_of(&e.ok(&["spawn", "merged"]));
+    fs::write(merged.join("c.txt"), "see\n").unwrap();
+    git(&merged, &["add", "-A"]);
+    git(&merged, &["commit", "-q", "-m", "c"]);
+    git(
+        &e.repo,
+        &[
+            "merge",
+            "-q",
+            "--ff-only",
+            &git(&merged, &["rev-parse", "HEAD"]),
+        ],
+    );
+    let unused = path_of(&e.ok(&["spawn", "unused"]));
+    age("merged");
+    age("unused");
+
+    let spawn_with_auto_prune = |name: &str| {
+        let out = cmd(env!("CARGO_BIN_EXE_agent-ws"), &e.repo)
+            .env("AGENT_WS_HOME", &e.home)
+            .env("AGENT_WS_NO_REFILL", "1")
+            .args(["spawn", name])
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+    };
+    spawn_with_auto_prune("trigger");
+    for _ in 0..200 {
+        if !merged.exists() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(!merged.exists(), "the merged workspace was pruned");
+    assert!(unused.exists(), "never-used workspaces stay");
+    assert!(home_dir(&e).join("auto-prune.stamp").exists());
+
+    // `auto_prune = false` turns it off.
+    fs::remove_file(home_dir(&e).join("auto-prune.stamp")).unwrap();
+    fs::write(e.repo.join(".agent-ws.toml"), "auto_prune = false\n").unwrap();
+    spawn_with_auto_prune("quiet");
+    assert!(!home_dir(&e).join("auto-prune.stamp").exists());
 }
