@@ -101,7 +101,9 @@ Every command accepts `--json` for scripts.
 | `status [NAME]` | Changed files per workspace and files changed in more than one (`OVERLAP`) |
 | `land NAME -m MSG` | Commit, create branch `agent-ws/NAME`, remove the workspace. `--branch B`, `--keep`, `--no-verify`, `--force-branch` |
 | `drop NAME` | Remove a workspace without landing |
-| `pool set N` / `fill` / `status` / `clear` | Keep N workspaces ready |
+| `prune` | Drop workspaces whose work is already merged. `--dry-run`, `--base BRANCH`, `--gh`, `--min-age-min N` |
+| `du [NAME]` | Real disk use per workspace (bytes no other file shares) next to what `du` shows |
+| `pool set N` / `fill` / `status` / `clear` | Keep N workspaces ready (at most 8) |
 | `gc [--dry-run]` | Clean up after crashed or killed processes |
 
 ## What a workspace contains
@@ -114,13 +116,49 @@ Every command accepts `--json` for scripts.
   `id_ed25519`; `.env.example` and friends stay). Removed secrets are listed in
   the `spawn` output; `--keep-secrets` keeps them.
 
+## Disk use and cleanup
+
+`du` counts a cloned file in full in every workspace, so `du -sh ~/.agent-ws`
+shows about the size of your checkout per workspace. The real cost is
+`agent-ws du`: the bytes no other file shares, usually 10 – 50 MB per
+workspace.
+
+That cost grows when a workspace is kept around. When the source checkout
+rewrites files (a reinstall, a rebuild), every old workspace becomes the only
+owner of its copy. Drop workspaces when their branch is merged:
+
+```sh
+git fetch                             # prune compares against origin's branch
+agent-ws prune --dry-run              # what would go, and the space it frees
+agent-ws prune                        # drop them
+```
+
+`prune` drops a workspace only when its tree is clean (ignored files such as
+`node_modules` do not count) and one of these holds:
+
+- its HEAD is in the base branch (`merged`);
+- every file it changed is the same in the base, as after a squash or rebase
+  merge (`squash-merged`);
+- with `--gh`, GitHub has a merged PR from its branch at exactly its HEAD
+  (`pr-merged`);
+- it has no commits and no changes since spawn (`unused`).
+
+It never touches a workspace with uncommitted changes or unmerged commits,
+one created less than an hour ago (`--min-age-min`), or one that a running
+process (an agent, a shell) has as its current directory. The base is
+`--base`, else `prune_base` from the config, else `origin/HEAD`,
+`origin/main`, `origin/master`, `main` or `master`, the first that exists.
+
+`spawn` warns from 20 workspaces and below 10 GB free disk. See
+[docs/disk-usage.md](docs/disk-usage.md) for measurements.
+
 ## Pool
 
 `agent-ws pool set N` keeps N workspaces ready, so `spawn` takes ~40 ms and
 refills the pool in the background. A pooled workspace is only handed out
 while it still matches your repository: same `HEAD`, same settings, same
 lockfiles. Spawns with `--base`, `--exclude`, `--keep-secrets` or `--no-pool`
-always clone fresh. `pool set 0` turns it off.
+always clone fresh. `pool set 0` turns it off; the maximum is 8.
 
 ## Configuration
 
@@ -134,6 +172,8 @@ strict_symlinks = true          # fail spawn if a symlink points outside the wor
 min_free_gb = 5                 # refuse to spawn below this (default 2)
 pool = 4                        # default pool size; `pool set` overrides it
 pool_stamp = ["pnpm-lock.yaml"] # files whose change makes pooled workspaces stale
+prune_base = "origin/develop"   # branch `prune` compares against
+warn_workspaces = 30            # spawn warns from this many workspaces (0 = never)
 ```
 
 Unknown keys are an error. Workspaces and state live in
@@ -150,6 +190,8 @@ volume as the repository).
 | `corrupt record` | A state file was edited by hand; `agent-ws gc` forgets it safely. |
 | `WARNING symlink ... points outside the workspace` | Writes through that link leave the workspace. Fix the link, or set `strict_symlinks`. |
 | First build in a workspace is slow | Expected: files are read cold once; later builds are warm. |
+| `du` shows huge numbers for `~/.agent-ws` | Shared clone blocks are counted once per workspace. `agent-ws du` shows the real use; `agent-ws prune` frees merged ones. |
+| `WARNING N workspaces exist` | `agent-ws prune --dry-run`, then `agent-ws prune`; drop the rest you no longer need. |
 
 ## Benchmarks
 

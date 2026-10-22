@@ -108,8 +108,53 @@ contents per file, not per shared disk block.
   interrupted land) or was landed earlier by the same workspace (`--keep`),
   which then moves forward. Changed files count every path touched: a rename
   is two, so deleting a file another workspace edits is an overlap.
-- `drop` renames the tree into `.trash` and deletes it in the background.
-- Spawning stops below 2 GB of free disk (configurable).
+- `drop` renames the tree into `.trash` and deletes it with a background
+  `rm -rf` in its own process group, so closing the terminal does not stop
+  it. Each `drop` restarts deletes older than 10 minutes.
+- Spawning stops below 2 GB of free disk (configurable) and warns below
+  10 GB or from 20 workspaces (`warn_workspaces`).
+- The pool holds at most 8 workspaces.
+
+## Disk use and prune
+
+A cloned block belongs to every file that shares it, so `du` counts it once
+per workspace. `agent-ws du` asks APFS instead: `getattrlist` with
+`ATTR_CMNEXT_PRIVATESIZE` gives the bytes of a file that no other file
+shares, which is what deleting it frees. Workspaces are walked in parallel,
+one thread per core. Data not yet flushed has no blocks yet and counts later.
+Blocks shared by two workspaces but no longer by the source are private to
+neither, so the sum is a lower bound for a group.
+
+`prune` checks each ready workspace, cheapest test first:
+
+```mermaid
+flowchart TD
+    A[ready workspace] --> B{folder exists?}
+    B -- no --> K[keep: gc handles it]
+    B -- yes --> C{a process has its cwd inside?}
+    C -- yes --> K2[keep: in use]
+    C -- no --> D{younger than --min-age-min?}
+    D -- yes --> K3[keep]
+    D -- no --> E{git status clean?<br/>ignored files do not count}
+    E -- no --> K4[keep: uncommitted changes]
+    E -- yes --> F{HEAD == spawn base?}
+    F -- yes --> P[drop: unused]
+    F -- no --> G{HEAD ancestor of base?}
+    G -- yes --> P2[drop: merged]
+    G -- no --> H{every path changed since the fork point<br/>equal in base?}
+    H -- yes --> P3[drop: squash-merged]
+    H -- no --> I{--gh and merged PR<br/>from its branch at HEAD?}
+    I -- yes --> P4[drop: pr-merged]
+    I -- no --> K5[keep: commits not in base]
+```
+
+All checks are read-only (`git --no-optional-locks status`, `merge-base`,
+`diff`), so `--dry-run` writes nothing, not even the index. A branch whose
+upstream is gone is not enough on its own: a closed, unmerged PR deletes its
+branch too. Dropping goes through `drop`.
+
+The current directories come from `proc_pidinfo(PROC_PIDVNODEPATHINFO)` for
+every process of the user.
 
 ## Many agents at once
 
@@ -141,8 +186,8 @@ the repository. The folder is excluded from Spotlight and Time Machine.
 
 | File | Role |
 | --- | --- |
-| `src/lib.rs` | `Repo`: spawn, claim, create/fill, pool, gc, status, land, drop |
-| `src/fsutil.rs` | `clonefile` FFI, tree clone, free space, the workspace scan, glob |
+| `src/lib.rs` | `Repo`: spawn, claim, create/fill, pool, gc, prune, du, status, land, drop |
+| `src/fsutil.rs` | `clonefile` FFI, tree clone, free space, private size, cwd users, the workspace scan, glob |
 | `src/git.rs` | `git` CLI wrapper and changed-path listing |
 | `src/config.rs` | `.agent-ws.toml` |
 | `src/main.rs` | thin CLI (clap) and background refill |
