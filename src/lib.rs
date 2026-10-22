@@ -25,6 +25,22 @@ const POOL_PREFIX: &str = "@pool-";
 
 const GB: u64 = 1_000_000_000;
 
+/// Largest pool. Every pooled workspace turns into real disk use once the
+/// source checkout rewrites the files it shares (a reinstall, a rebuild).
+pub const MAX_POOL: usize = 8;
+
+/// `spawn` warns from this many workspaces on (see `warn_workspaces`).
+const WARN_WORKSPACES: usize = 20;
+
+/// `spawn` warns below this much free disk.
+const WARN_FREE: u64 = 10 * GB;
+
+/// Trash entries older than this are leftovers of a killed background `rm`.
+const TRASH_GRACE_NS: u128 = 600 * 1_000_000_000;
+
+/// `prune` leaves workspaces younger than this alone by default.
+pub const PRUNE_MIN_AGE_SECS: u64 = 3600;
+
 pub struct Repo {
     /// Main checkout of the repository.
     pub root: PathBuf,
@@ -88,6 +104,65 @@ pub struct Spawned {
     pub clone_calls: usize,
     #[serde(flatten)]
     pub notes: Notes,
+    /// Many workspaces or little free disk: time to `prune`.
+    pub warnings: Vec<String>,
+}
+
+/// Disk use of one workspace, pooled workspace or trash entry.
+#[derive(Serialize)]
+pub struct WsUsage {
+    pub name: String,
+    pub path: PathBuf,
+    /// `workspace`, `pool` or `trash`.
+    pub kind: String,
+    #[serde(flatten)]
+    pub usage: fsutil::Usage,
+}
+
+#[derive(Serialize)]
+pub struct DiskUsage {
+    pub entries: Vec<WsUsage>,
+    pub total: fsutil::Usage,
+    pub free_bytes: u64,
+}
+
+pub struct PruneOpts {
+    /// Branch or commit the work must be in (default: see `Repo::prune_base`).
+    pub base: Option<String>,
+    pub dry_run: bool,
+    /// Also ask GitHub (`gh`) whether the workspace branch's PR was merged.
+    pub gh: bool,
+    /// Leave workspaces created less than this many seconds ago.
+    pub min_age_secs: u64,
+}
+
+#[derive(Serialize)]
+pub struct Pruned {
+    pub name: String,
+    pub path: PathBuf,
+    /// `merged` (HEAD is in the base), `squash-merged` (merging HEAD into the
+    /// base changes nothing), `pr-merged` (GitHub merged a PR at HEAD) or
+    /// `unused` (no commits and no changes since spawn).
+    pub reason: String,
+    /// Bytes only this workspace holds; deleting it frees at least this.
+    pub private_bytes: u64,
+}
+
+#[derive(Serialize)]
+pub struct Kept {
+    pub name: String,
+    pub why: String,
+}
+
+#[derive(Serialize)]
+pub struct Prune {
+    /// The base as given and the commit it resolved to.
+    pub base: String,
+    pub base_commit: String,
+    pub dry_run: bool,
+    pub pruned: Vec<Pruned>,
+    pub kept: Vec<Kept>,
+    pub freed_bytes: u64,
 }
 
 #[derive(Serialize, Default)]
@@ -388,9 +463,13 @@ impl Repo {
             .map(|n| n as usize)
             .or(self.config.pool)
             .unwrap_or(0)
+            .min(MAX_POOL)
     }
 
     pub fn pool_set(&self, size: usize) -> Result<()> {
+        if size > MAX_POOL {
+            bail!("pool size {size} is above the maximum of {MAX_POOL}");
+        }
         self.prepare_home()?;
         std::fs::write(
             self.dir.join("pool.json"),
@@ -406,8 +485,9 @@ impl Repo {
         if o.use_pool && o.exclude.is_empty() && !o.keep_secrets {
             let head = self.resolve(None)?;
             if self.resolve(o.base.as_deref())? == head
-                && let Some(s) = self.claim(&o.name, &self.pool_key(&head), t0)?
+                && let Some(mut s) = self.claim(&o.name, &self.pool_key(&head), t0)?
             {
+                s.warnings = self.spawn_warnings();
                 return Ok(s);
             }
         }
@@ -428,13 +508,14 @@ impl Repo {
         };
         write_record(&rec, &meta, true)?;
         match self.create(o, &path, t0) {
-            Ok(s) => {
+            Ok(mut s) => {
                 meta.base = s.base.clone();
                 meta.state = ready();
                 meta.pid = 0;
                 meta.pid_start = 0;
                 meta.notes = s.notes.clone();
                 write_record(&rec, &meta, false)?;
+                s.warnings = self.spawn_warnings();
                 Ok(s)
             }
             Err(e) => {
@@ -483,6 +564,7 @@ impl Repo {
                 total_ms: t0.elapsed().as_millis(),
                 clone_calls: 0,
                 notes: m.notes,
+                warnings: vec![],
             }));
         }
         Ok(None)
@@ -527,6 +609,7 @@ impl Repo {
                 total_ms: t0.elapsed().as_millis(),
                 clone_calls,
                 notes,
+                warnings: vec![],
             }),
             Err(e) => {
                 let _ = self.discard(path);
@@ -847,33 +930,256 @@ impl Repo {
                 }
             }
         }
-        if let Ok(rd) = std::fs::read_dir(self.dir.join(".trash")) {
-            let now_ns = nanos();
-            for e in rd {
-                let e = e?;
-                // Entries are named `<name>-<nanos>`. Recent ones are still
-                // being deleted by their own background `rm`.
-                let name = e.file_name().to_string_lossy().into_owned();
-                let born = name
-                    .rsplit('-')
-                    .next()
-                    .and_then(|n| n.parse::<u128>().ok())
-                    .unwrap_or(0);
-                if now_ns.saturating_sub(born) < 600 * 1_000_000_000 {
-                    continue;
-                }
-                report.trash += 1;
-                if !dry_run {
-                    delete_in_background(&e.path())?;
-                }
-            }
-        }
+        report.trash = self.sweep_trash(dry_run)?;
         if !dry_run && self.dir.exists() {
             git::run(&self.root, &["worktree", "prune"])?;
         }
         report.orphans.sort();
         report.corrupt.sort();
         Ok(report)
+    }
+
+    /// Restart the delete of trash entries whose background `rm` died (older
+    /// than 10 minutes). Returns how many there were.
+    fn sweep_trash(&self, dry_run: bool) -> Result<usize> {
+        let mut n = 0;
+        let now_ns = nanos();
+        for e in std::fs::read_dir(self.dir.join(".trash"))
+            .into_iter()
+            .flatten()
+        {
+            let e = e?;
+            // Entries are named `<name>-<nanos>`. Recent ones are still
+            // being deleted by their own background `rm`.
+            let name = e.file_name().to_string_lossy().into_owned();
+            let born = name
+                .rsplit('-')
+                .next()
+                .and_then(|n| n.parse::<u128>().ok())
+                .unwrap_or(0);
+            if now_ns.saturating_sub(born) < TRASH_GRACE_NS {
+                continue;
+            }
+            n += 1;
+            if !dry_run {
+                delete_in_background(&e.path())?;
+            }
+        }
+        Ok(n)
+    }
+
+    /// Warnings for `spawn`: many workspaces, or little free disk.
+    fn spawn_warnings(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        let limit = self.config.warn_workspaces.unwrap_or(WARN_WORKSPACES);
+        let count = self.list().map(|l| l.len()).unwrap_or(0);
+        if limit > 0 && count >= limit {
+            out.push(format!(
+                "{count} workspaces exist; drop finished ones or run `agent-ws prune`"
+            ));
+        }
+        if let Ok(free) = fsutil::free_bytes(&self.dir)
+            && free < WARN_FREE
+        {
+            out.push(format!(
+                "only {:.1} GB free on disk; see `agent-ws du` and `agent-ws prune`",
+                free as f64 / GB as f64
+            ));
+        }
+        out
+    }
+
+    /// Real disk use of every workspace, pooled workspace and trash entry.
+    /// `only` limits it to one named workspace.
+    pub fn du(&self, only: Option<&str>) -> Result<DiskUsage> {
+        let mut todo: Vec<(String, PathBuf, &str)> = Vec::new();
+        if let Some(n) = only {
+            let m = self.meta(n)?;
+            todo.push((m.name, m.path, "workspace"));
+        } else {
+            for m in self.list()? {
+                todo.push((m.name, m.path, "workspace"));
+            }
+            for (_, m) in read_records(&self.dir.join("pool"), ".json") {
+                if self.owns(&m.path) {
+                    todo.push((m.name, m.path, "pool"));
+                }
+            }
+            for e in std::fs::read_dir(self.dir.join(".trash"))
+                .into_iter()
+                .flatten()
+            {
+                let e = e?;
+                todo.push((
+                    e.file_name().to_string_lossy().into_owned(),
+                    e.path(),
+                    "trash",
+                ));
+            }
+        }
+        let sizes = usage_parallel(todo.iter().map(|t| t.1.clone()).collect());
+        let mut total = fsutil::Usage::default();
+        let entries = todo
+            .into_iter()
+            .zip(sizes)
+            .map(|((name, path, kind), usage)| {
+                total += usage;
+                WsUsage {
+                    name,
+                    path,
+                    kind: kind.into(),
+                    usage,
+                }
+            })
+            .collect();
+        Ok(DiskUsage {
+            entries,
+            total,
+            free_bytes: fsutil::free_bytes(&self.dir).unwrap_or(0),
+        })
+    }
+
+    /// The branch `prune` compares against: `prune_base` from the config,
+    /// else the remote's default branch, else the first of `origin/main`,
+    /// `origin/master`, `main`, `master` that exists.
+    pub fn prune_base(&self) -> Result<String> {
+        if let Some(b) = &self.config.prune_base {
+            return Ok(b.clone());
+        }
+        if let Ok(r) = git::line(
+            &self.root,
+            &["symbolic-ref", "-q", "--short", "refs/remotes/origin/HEAD"],
+        ) && !r.is_empty()
+        {
+            return Ok(r);
+        }
+        for b in ["origin/main", "origin/master", "main", "master"] {
+            if self.resolve(Some(b)).is_ok() {
+                return Ok(b.into());
+            }
+        }
+        bail!("no base branch found; pass --base BRANCH or set prune_base")
+    }
+
+    /// Why a clean workspace's work is already in `base`, or `None`.
+    fn merged_reason(&self, m: &Meta, head: &str, base: &str, gh: bool) -> Option<String> {
+        if head == m.base {
+            return Some("unused".into());
+        }
+        let ok = |args: &[&str]| {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&m.path)
+                .args(args)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .is_ok_and(|s| s.success())
+        };
+        if ok(&["merge-base", "--is-ancestor", head, base]) {
+            return Some("merged".into());
+        }
+        // Squash and rebase merges leave HEAD outside the base. Their work is
+        // in the base when every path HEAD changed since the fork point is
+        // identical in the base. Read-only (no merge objects written); a
+        // base that changed those paths again later keeps the workspace.
+        if let Ok(fork) = git::line(&m.path, &["merge-base", head, base])
+            && let Ok(changed) = git::run(&m.path, &["diff", "--name-only", "-z", &fork, head])
+        {
+            let paths: Vec<&str> = changed.split('\0').filter(|p| !p.is_empty()).collect();
+            let mut args = vec!["--literal-pathspecs", "diff", "--quiet", base, head, "--"];
+            args.extend(&paths);
+            if paths.is_empty() || ok(&args) {
+                return Some("squash-merged".into());
+            }
+        }
+        if gh
+            && let Ok(branch) = git::line(&m.path, &["symbolic-ref", "-q", "--short", "HEAD"])
+            && pr_merged_at(&self.root, &branch, head)
+        {
+            return Some("pr-merged".into());
+        }
+        None
+    }
+
+    /// Drop workspaces whose work is already in the base branch: clean tree
+    /// (ignored files aside) and HEAD merged, squash-merged, merged as a
+    /// GitHub PR (`gh`), or never moved since spawn. Never touches a
+    /// workspace with uncommitted or unmerged work, one younger than
+    /// `min_age_secs`, or one that a process has as its current directory.
+    pub fn prune(&self, o: &PruneOpts) -> Result<Prune> {
+        let base = match &o.base {
+            Some(b) => b.clone(),
+            None => self.prune_base()?,
+        };
+        let base_commit = self
+            .resolve(Some(&base))
+            .with_context(|| format!("base {base:?} not found"))?;
+        let mut pruned = Vec::new();
+        let mut kept = Vec::new();
+        let now = now();
+        let users = fsutil::cwd_users(
+            &std::fs::canonicalize(self.dir.join("ws")).unwrap_or(self.dir.join("ws")),
+        );
+        for m in self.list()? {
+            let keep = |why: String| Kept {
+                name: m.name.clone(),
+                why,
+            };
+            if !m.path.exists() {
+                kept.push(keep("folder is missing (run `agent-ws gc`)".into()));
+                continue;
+            }
+            let real = std::fs::canonicalize(&m.path).unwrap_or(m.path.clone());
+            if let Some((pid, _)) = users.iter().find(|(_, cwd)| cwd.starts_with(&real)) {
+                kept.push(keep(format!("in use by process {pid}")));
+                continue;
+            }
+            let age = now.saturating_sub(m.created);
+            if age < o.min_age_secs {
+                kept.push(keep(format!("created {}m ago", age / 60)));
+                continue;
+            }
+            // No optional locks: a dry run must not even refresh the index.
+            let dirty = match git::run(&m.path, &["--no-optional-locks", "status", "--porcelain"]) {
+                Ok(s) => !s.trim().is_empty(),
+                Err(_) => true,
+            };
+            if dirty {
+                kept.push(keep("uncommitted changes".into()));
+                continue;
+            }
+            let Ok(head) = git::line(&m.path, &["rev-parse", "HEAD"]) else {
+                kept.push(keep("cannot read HEAD".into()));
+                continue;
+            };
+            match self.merged_reason(&m, &head, &base_commit, o.gh) {
+                Some(reason) => pruned.push(Pruned {
+                    name: m.name.clone(),
+                    path: m.path.clone(),
+                    reason,
+                    private_bytes: 0,
+                }),
+                None => kept.push(keep(format!("commits not in {base}"))),
+            }
+        }
+        let sizes = usage_parallel(pruned.iter().map(|p| p.path.clone()).collect());
+        for (p, u) in pruned.iter_mut().zip(sizes) {
+            p.private_bytes = u.private;
+        }
+        if !o.dry_run {
+            for p in &pruned {
+                self.drop(&p.name)?;
+            }
+        }
+        Ok(Prune {
+            base,
+            base_commit,
+            dry_run: o.dry_run,
+            freed_bytes: pruned.iter().map(|p| p.private_bytes).sum(),
+            pruned,
+            kept,
+        })
     }
 
     /// Changed paths per ready workspace, skipping folders deleted by hand.
@@ -1032,8 +1338,50 @@ impl Repo {
         let m = self.meta(name)?;
         self.discard(&m.path)?;
         std::fs::remove_file(self.meta_path(name))?;
+        // Finish deletes that an earlier killed process left in the trash.
+        self.sweep_trash(false)?;
         Ok(())
     }
+}
+
+/// `fsutil::usage` of several trees at once (each walk is syscall-bound).
+fn usage_parallel(paths: Vec<PathBuf>) -> Vec<fsutil::Usage> {
+    let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
+    let chunk = paths.len().div_ceil(threads).max(1);
+    std::thread::scope(|s| {
+        let handles: Vec<_> = paths
+            .chunks(chunk)
+            .map(|c| s.spawn(move || c.iter().map(|p| fsutil::usage(p)).collect::<Vec<_>>()))
+            .collect();
+        handles
+            .into_iter()
+            .flat_map(|h| h.join().unwrap_or_default())
+            .collect()
+    })
+}
+
+/// Whether GitHub has a merged PR from `branch` whose head is `head`.
+/// False when `gh` is missing, not logged in, or offline.
+fn pr_merged_at(root: &Path, branch: &str, head: &str) -> bool {
+    let out = std::process::Command::new("gh")
+        .current_dir(root)
+        .args([
+            "pr",
+            "list",
+            "--state",
+            "merged",
+            "--head",
+            branch,
+            "--json",
+            "headRefOid",
+        ])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output();
+    let Ok(out) = out else { return false };
+    out.status.success()
+        && serde_json::from_slice::<Vec<serde_json::Value>>(&out.stdout)
+            .is_ok_and(|prs| prs.iter().any(|p| p["headRefOid"] == head))
 }
 
 /// Give every checked-out submodule its own copy of its git dir, then check
@@ -1086,9 +1434,13 @@ fn isolate_submodules(ws_repo: &Path, src_repo: &Path, rev: &str) -> Result<()> 
 }
 
 fn delete_in_background(path: &Path) -> Result<()> {
+    use std::os::unix::process::CommandExt;
     std::process::Command::new("rm")
         .arg("-rf")
         .arg(path)
+        // Own process group: closing the terminal or killing the agent's
+        // group must not stop the delete and leave the tree in `.trash`.
+        .process_group(0)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())

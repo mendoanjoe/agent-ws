@@ -935,3 +935,173 @@ fn n3_untracked_unignored_secrets_are_reported_and_keepable() {
         "other untracked files are still left out"
     );
 }
+
+fn names(v: &serde_json::Value, key: &str) -> Vec<String> {
+    let mut out: Vec<String> = v[key]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|w| w["name"].as_str().unwrap().to_string())
+        .collect();
+    out.sort();
+    out
+}
+
+#[test]
+fn p1_prune_drops_only_clean_merged_workspaces() {
+    let e = Env::new();
+    let commit = |ws: &Path, file: &str, text: &str| {
+        fs::write(ws.join(file), text).unwrap();
+        git(ws, &["add", "-A"]);
+        git(ws, &["commit", "-q", "-m", file]);
+        git(ws, &["rev-parse", "HEAD"])
+    };
+    // Merged with a fast-forward.
+    let merged = path_of(&e.ok(&["spawn", "merged"]));
+    let merged_head = commit(&merged, "c.txt", "see\n");
+    // Rebuilt deps after the merge: ignored files never make a tree dirty.
+    fs::write(merged.join("node_modules/dep/index.js"), "rebuilt\n").unwrap();
+    // Squash-merged: the same change lands as a different commit.
+    let squashed = path_of(&e.ok(&["spawn", "squashed"]));
+    commit(&squashed, "b.txt", "bee 2\n");
+    commit(&squashed, "d.txt", "dee\n");
+    // Never used, uncommitted work, unmerged commits, and an agent inside.
+    e.ok(&["spawn", "unused"]);
+    let dirty = path_of(&e.ok(&["spawn", "dirty"]));
+    fs::write(dirty.join("a.txt"), "edited\n").unwrap();
+    let ahead = path_of(&e.ok(&["spawn", "ahead"]));
+    commit(&ahead, "e.txt", "only here\n");
+    let busy = path_of(&e.ok(&["spawn", "busy"]));
+    let mut agent = Command::new("sleep")
+        .arg("60")
+        .current_dir(&busy)
+        .spawn()
+        .unwrap();
+
+    git(&e.repo, &["merge", "-q", "--ff-only", &merged_head]);
+    fs::write(e.repo.join("b.txt"), "bee 2\n").unwrap();
+    fs::write(e.repo.join("d.txt"), "dee\n").unwrap();
+    git(&e.repo, &["add", "b.txt", "d.txt"]);
+    git(&e.repo, &["commit", "-q", "-m", "squash"]);
+
+    // Young workspaces are left alone by default.
+    let young = e.ok(&["prune", "--dry-run", "--base", "main"]);
+    assert!(names(&young, "pruned").is_empty());
+
+    let args = ["prune", "--base", "main", "--min-age-min", "0"];
+    let dry = e.ok(&[&args[..], &["--dry-run"]].concat());
+    assert_eq!(names(&dry, "pruned"), ["merged", "squashed", "unused"]);
+    assert_eq!(names(&dry, "kept"), ["ahead", "busy", "dirty"]);
+    let reasons: Vec<&str> = dry["pruned"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["reason"].as_str().unwrap())
+        .collect();
+    assert_eq!(reasons, ["merged", "squash-merged", "unused"]);
+    // Unflushed writes may not be allocated yet, so only the sum is exact.
+    let sum: u64 = dry["pruned"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["private_bytes"].as_u64().unwrap())
+        .sum();
+    assert_eq!(dry["freed_bytes"].as_u64(), Some(sum));
+    assert!(
+        merged.exists() && squashed.exists(),
+        "dry run changes nothing"
+    );
+
+    let done = e.ok(&args);
+    assert_eq!(names(&done, "pruned"), ["merged", "squashed", "unused"]);
+    agent.kill().unwrap();
+    agent.wait().unwrap();
+    assert!(!merged.exists() && !squashed.exists());
+    let left: Vec<String> = e
+        .ok(&["list"])
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["name"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(left, ["ahead", "busy", "dirty"]);
+    // The agent left: the busy workspace is now an unused one.
+    let again = e.ok(&args);
+    assert_eq!(names(&again, "pruned"), ["busy"]);
+    assert!(e.err(&["prune", "--base", "nope"]).contains("nope"));
+}
+
+#[test]
+fn p2_du_reports_real_unshared_bytes() {
+    let e = Env::new();
+    let ws = path_of(&e.ok(&["spawn", "w"]));
+    e.ok(&["spawn", "idle"]);
+    let du = e.ok(&["du"]);
+    let idle = &du["entries"][0];
+    assert_eq!(idle["name"], "idle");
+    assert_eq!(idle["kind"], "workspace");
+    assert!(idle["allocated"].as_u64().unwrap() > 0);
+
+    {
+        use std::io::Write;
+        let mut f = fs::File::create(ws.join("big.bin")).unwrap();
+        f.write_all(&vec![1u8; 2 << 20]).unwrap();
+        f.sync_all().unwrap();
+    }
+    let du = e.ok(&["du", "w"]);
+    assert_eq!(du["entries"].as_array().unwrap().len(), 1);
+    let w = &du["entries"][0];
+    assert!(w["private"].as_u64().unwrap() >= 2 << 20);
+    assert!(w["allocated"].as_u64() >= w["private"].as_u64());
+    assert_eq!(du["total"]["private"], w["private"]);
+    assert!(du["free_bytes"].as_u64().unwrap() > 0);
+
+    // Forgotten trash shows up, and the next drop finishes deleting it.
+    let leftover = home_dir(&e).join(".trash/leftover-1000");
+    fs::create_dir_all(&leftover).unwrap();
+    fs::write(leftover.join("x"), "x").unwrap();
+    let du = e.ok(&["du"]);
+    assert!(
+        du["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t["kind"] == "trash" && t["name"] == "leftover-1000")
+    );
+    e.ok(&["drop", "idle"]);
+    for _ in 0..100 {
+        if !leftover.exists() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(!leftover.exists(), "drop restarts stale trash deletes");
+}
+
+#[test]
+fn p3_pool_is_capped_and_spawn_warns() {
+    let e = Env::new();
+    assert!(e.err(&["pool", "set", "9"]).contains("maximum"));
+    e.ok(&["pool", "set", "8"]);
+    e.ok(&["pool", "set", "0"]);
+
+    fs::write(e.repo.join(".agent-ws.toml"), "warn_workspaces = 2\n").unwrap();
+    let first = e.ok(&["spawn", "one"]);
+    assert!(
+        !first["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|w| w.as_str().unwrap().contains("workspaces exist"))
+    );
+    let second = e.ok(&["spawn", "two"]);
+    assert!(
+        second["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|w| w.as_str().unwrap().contains("2 workspaces exist"))
+    );
+    let human = String::from_utf8(e.run(&["spawn", "three"]).stdout).unwrap();
+    assert!(human.contains("WARNING 3 workspaces exist"), "{human}");
+}

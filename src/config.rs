@@ -51,6 +51,10 @@ pub struct Config {
     pub pool: Option<usize>,
     /// Files whose change makes pooled workspaces stale (replaces the defaults).
     pub pool_stamp: Option<Vec<String>>,
+    /// Branch `prune` compares against (default origin/HEAD, origin/main, …).
+    pub prune_base: Option<String>,
+    /// `spawn` warns once this many workspaces exist (default 20, 0 = never).
+    pub warn_workspaces: Option<usize>,
 }
 
 impl Config {

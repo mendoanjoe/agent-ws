@@ -1,4 +1,4 @@
-use agent_ws::{LandOpts, Repo, SpawnOpts};
+use agent_ws::{LandOpts, PruneOpts, Repo, SpawnOpts};
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
@@ -66,6 +66,24 @@ enum Cmd {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Drop workspaces whose work is already merged (clean tree only).
+    Prune {
+        /// Branch the work must be in (default: prune_base, origin/HEAD,
+        /// origin/main, origin/master, main, master).
+        #[arg(long)]
+        base: Option<String>,
+        /// Report what would be dropped and the space it frees; change nothing.
+        #[arg(long)]
+        dry_run: bool,
+        /// Also count a workspace branch whose GitHub PR was merged at HEAD.
+        #[arg(long)]
+        gh: bool,
+        /// Leave workspaces younger than this many minutes.
+        #[arg(long, default_value_t = agent_ws::PRUNE_MIN_AGE_SECS / 60)]
+        min_age_min: u64,
+    },
+    /// Real disk use per workspace: bytes not shared with any other file.
+    Du { name: Option<String> },
     /// Keep ready workspaces so spawning takes milliseconds.
     Pool {
         #[command(subcommand)]
@@ -93,6 +111,18 @@ enum PoolCmd {
 /// shorter value must not panic.
 fn short(id: &str) -> &str {
     id.get(..12).unwrap_or(id)
+}
+
+/// Bytes as `812 KB`, `14.2 MB`, `1.3 GB` (powers of 1000, like `df -H`).
+fn human(b: u64) -> String {
+    let b = b as f64;
+    if b >= 1e9 {
+        format!("{:.1} GB", b / 1e9)
+    } else if b >= 1e6 {
+        format!("{:.1} MB", b / 1e6)
+    } else {
+        format!("{:.0} KB", b / 1e3)
+    }
 }
 
 fn print<T: serde::Serialize>(json: bool, v: &T, human: impl FnOnce(&T)) -> Result<()> {
@@ -169,6 +199,9 @@ fn run(cli: Cli) -> Result<()> {
                 }
                 for p in &s.notes.secrets_removed {
                     println!("removed secret {p}");
+                }
+                for w in &s.warnings {
+                    println!("WARNING {w}");
                 }
             })
         }
@@ -255,6 +288,64 @@ fn run(cli: Cli) -> Result<()> {
             {
                 println!("nothing to clean");
             }
+        }),
+        Cmd::Prune {
+            base,
+            dry_run,
+            gh,
+            min_age_min,
+        } => print(
+            cli.json,
+            &repo.prune(&PruneOpts {
+                base,
+                dry_run,
+                gh,
+                min_age_secs: min_age_min * 60,
+            })?,
+            |p| {
+                let verb = if dry_run { "would drop" } else { "dropped" };
+                for w in &p.pruned {
+                    println!(
+                        "{verb} {:20} {:>9}  {}",
+                        w.name,
+                        human(w.private_bytes),
+                        w.reason
+                    );
+                }
+                for k in &p.kept {
+                    println!("keep {:25} {}", k.name, k.why);
+                }
+                println!(
+                    "{} {} workspaces merged into {} ({}), frees at least {}",
+                    verb,
+                    p.pruned.len(),
+                    p.base,
+                    short(&p.base_commit),
+                    human(p.freed_bytes)
+                );
+            },
+        ),
+        Cmd::Du { name } => print(cli.json, &repo.du(name.as_deref())?, |d| {
+            println!("{:>9} {:>9}  NAME", "REAL", "DU");
+            for e in &d.entries {
+                let kind = if e.kind == "workspace" {
+                    String::new()
+                } else {
+                    format!(" ({})", e.kind)
+                };
+                println!(
+                    "{:>9} {:>9}  {}{kind}",
+                    human(e.usage.private),
+                    human(e.usage.allocated),
+                    e.name
+                );
+            }
+            println!(
+                "{:>9} {:>9}  total, {} free on disk",
+                human(d.total.private),
+                human(d.total.allocated),
+                human(d.free_bytes)
+            );
         }),
         Cmd::Pool { cmd } => match cmd {
             PoolCmd::Set { size } => {
