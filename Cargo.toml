@@ -1,6 +1,6 @@
 [package]
 name = "agent-ws"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "Instant, isolated workspaces for coding agents on macOS (APFS clone-on-write)"
 license = "MIT"
