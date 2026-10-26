@@ -29,9 +29,10 @@ see [Benchmarks](#benchmarks).
 ## Install
 
 ```sh
-cargo install --git https://github.com/mendoanjoe/agent-ws
+cargo install agent-ws
 ```
 
+For the latest unreleased version: `cargo install --git https://github.com/mendoanjoe/agent-ws`,
 or from a clone: `cargo install --path .`
 
 ## Quick start
