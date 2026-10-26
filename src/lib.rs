@@ -6,6 +6,9 @@
 //! A pool of ready workspaces makes spawning a rename-sized operation.
 //! The library holds all logic so other tools can embed it.
 
+#[cfg(not(target_os = "macos"))]
+compile_error!("agent-ws only supports macOS: it needs APFS clonefile(2) and getattrlist(2).");
+
 pub mod config;
 pub mod fsutil;
 pub mod git;

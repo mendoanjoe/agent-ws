@@ -70,6 +70,21 @@ very good reason in the PR description.
 - One topic per PR. Describe what changed, why, and how you tested it.
 - Update the README or `docs/how-it-works.md` when behaviour changes.
 - If you change performance, include `bench/bench.sh` output before and after.
+- Add a line under `## [Unreleased]` in `CHANGELOG.md` for anything a user
+  would notice.
+
+## Releasing
+
+1. Move the `[Unreleased]` entries in `CHANGELOG.md` under a new
+   `## [X.Y.Z] - YYYY-MM-DD` heading and update the links at the bottom.
+2. Set `version` in `Cargo.toml`, run `cargo build`, and commit as
+   `chore: release vX.Y.Z`.
+3. `git tag -a vX.Y.Z -m "agent-ws vX.Y.Z" && git push origin master vX.Y.Z`.
+   The Release workflow builds the macOS binaries and creates the GitHub
+   release from the changelog section.
+4. `cargo publish`.
+5. In `mendoanjoe/homebrew-tap`, update `Formula/agent-ws.rb` with the new
+   version and the sha256 values from the release's `.sha256` files.
 
 ## Ideas that need help
 

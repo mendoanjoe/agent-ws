@@ -29,9 +29,13 @@ see [Benchmarks](#benchmarks).
 ## Install
 
 ```sh
-cargo install agent-ws
+brew install mendoanjoe/tap/agent-ws   # prebuilt binary
+cargo binstall agent-ws                # prebuilt binary, via cargo-binstall
+cargo install agent-ws                 # build from source (Rust 1.88+)
 ```
 
+Prebuilt binaries for Apple silicon and Intel are also attached to each
+[GitHub release](https://github.com/mendoanjoe/agent-ws/releases).
 For the latest unreleased version: `cargo install --git https://github.com/mendoanjoe/agent-ws`,
 or from a clone: `cargo install --path .`
 
