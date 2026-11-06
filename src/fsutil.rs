@@ -107,12 +107,49 @@ fn normalize(p: &Path) -> Option<PathBuf> {
     Some(out)
 }
 
+/// Whether `path` is a regular file holding only PEM certificates (or
+/// CRLs), comments allowed. Certificates are public: CA bundles such as
+/// certifi's `cacert.pem` match `*.pem` by name, yet pip and requests fail
+/// every HTTPS call without them. Keys, binary or unreadable files, and
+/// anything mentioning a private key are not.
+pub fn only_certificates(path: &Path) -> bool {
+    const LIMIT: u64 = 16 << 20;
+    let Ok(md) = std::fs::symlink_metadata(path) else {
+        return false;
+    };
+    if !md.is_file() || md.len() > LIMIT {
+        return false;
+    }
+    let Ok(raw) = std::fs::read(path) else {
+        return false;
+    };
+    if raw.windows(11).any(|w| w == b"PRIVATE KEY") {
+        return false;
+    }
+    let mut blocks = 0;
+    for line in raw.split(|&b| b == b'\n') {
+        let Some(label) = line
+            .trim_ascii()
+            .strip_prefix(b"-----BEGIN ")
+            .and_then(|l| l.strip_suffix(b"-----"))
+        else {
+            continue;
+        };
+        if !matches!(label, b"CERTIFICATE" | b"TRUSTED CERTIFICATE" | b"X509 CRL") {
+            return false;
+        }
+        blocks += 1;
+    }
+    blocks > 0
+}
+
 /// Walk the workspace once (skipping every `.git` file or folder):
 /// - absolute symlinks into `src_root` are retargeted into `dst_root`;
 /// - relative symlinks that climb out of the root are rewritten to the
 ///   absolute path they meant in the source, and reported as external;
 /// - other absolute symlinks are reported as external;
-/// - untracked files whose name matches `is_secret` are deleted.
+/// - untracked files whose name matches `is_secret` are deleted, unless
+///   they hold only certificates.
 pub fn scan(
     src_root: &Path,
     dst_root: &Path,
@@ -149,6 +186,7 @@ pub fn scan(
                 }
             } else if is_secret(&name.to_string_lossy())
                 && !tracked.contains(&*rel.to_string_lossy())
+                && !only_certificates(&p)
             {
                 std::fs::remove_file(&p)?;
                 found.secrets.push(rel.to_string_lossy().into_owned());
@@ -384,6 +422,34 @@ mod tests {
         child.wait().unwrap();
         assert!(found);
         assert!(cwd_users(&dir.join("nothing-here")).is_empty());
+    }
+
+    #[test]
+    fn only_certificates_spares_bundles_not_keys() {
+        let tmp = tempfile::tempdir().unwrap();
+        let check = |body: &[u8]| {
+            let p = tmp.path().join("f.pem");
+            std::fs::write(&p, body).unwrap();
+            only_certificates(&p)
+        };
+        let cert = "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n";
+        assert!(check(cert.as_bytes()));
+        assert!(check(cert.replace('\n', "\r\n").as_bytes()), "CRLF");
+        let crl = "-----BEGIN X509 CRL-----\nMIIB\n-----END X509 CRL-----\n";
+        assert!(check(format!("# Issuer: CN=x\n{cert}\n{crl}").as_bytes()));
+        assert!(
+            !check(format!("{cert}  -----BEGIN PRIVATE KEY-----\nMIIE\n").as_bytes()),
+            "a key anywhere makes it secret"
+        );
+        assert!(!check(b"-----BEGIN OPENSSH PRIVATE KEY-----\nb3Bl\n"));
+        assert!(!check(
+            b"-----BEGIN PGP MESSAGE-----\nhQEM\n-----END PGP MESSAGE-----\n"
+        ));
+        assert!(!check(b"key"), "not PEM");
+        assert!(!check(b""));
+        assert!(!only_certificates(&tmp.path().join("missing.pem")));
+        std::fs::create_dir(tmp.path().join("dir.pem")).unwrap();
+        assert!(!only_certificates(&tmp.path().join("dir.pem")));
     }
 
     #[test]

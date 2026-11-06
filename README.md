@@ -119,7 +119,9 @@ Every command accepts `--json` for scripts.
 - Not: your uncommitted edits, untracked files, or untracked secret files
   (`.env`, `.env.*`, `.dev.vars`, `*.pem`, `*.key`, `*.p12`, `id_rsa`,
   `id_ed25519`; `.env.example` and friends stay). Removed secrets are listed in
-  the `spawn` output; `--keep-secrets` keeps them.
+  the `spawn` output; `--keep-secrets` keeps them. Files holding only
+  certificates, such as the `cacert.pem` CA bundle in a Python `.venv`, are
+  public and stay.
 
 ## Disk use and cleanup
 
@@ -144,8 +146,8 @@ agent-ws prune                        # drop them
 - its HEAD is in the base branch (`merged`);
 - every file it changed is the same in the base, as after a squash or rebase
   merge (`squash-merged`);
-- with `--gh`, GitHub has a merged PR from its branch at exactly its HEAD
-  (`pr-merged`);
+- with `--gh`, GitHub has a merged PR from a branch at exactly its HEAD, such
+  as the `agent-ws/NAME` branch a `land --keep` created (`pr-merged`);
 - it has no commits and no changes since spawn (`unused`).
 
 It never touches a workspace with uncommitted changes or unmerged commits,

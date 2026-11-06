@@ -136,7 +136,8 @@ pub struct PruneOpts {
     /// Branch or commit the work must be in (default: see `Repo::prune_base`).
     pub base: Option<String>,
     pub dry_run: bool,
-    /// Also ask GitHub (`gh`) whether the workspace branch's PR was merged.
+    /// Also ask GitHub (`gh`) whether a PR from a branch at the workspace
+    /// HEAD was merged.
     pub gh: bool,
     /// Leave workspaces created less than this many seconds ago.
     pub min_age_secs: u64,
@@ -300,6 +301,29 @@ fn check_name(name: &str) -> Result<()> {
         bail!("invalid workspace name {name:?}: use letters, digits, '.', '_' or '-'");
     }
     Ok(())
+}
+
+/// Rules for a new workspace: `check_name`, and the name must work in the
+/// branch `land` creates. Kept apart from `check_name`, which also decides
+/// what `owns` accepts: workspaces made before this rule stay manageable.
+fn check_new_name(name: &str) -> Result<()> {
+    check_name(name)?;
+    if name.contains("..") || name.ends_with('.') || name.ends_with(".lock") {
+        bail!(
+            "invalid workspace name {name:?}: it becomes the branch agent-ws/{name}, and Git branch names cannot contain '..' or end with '.' or '.lock'"
+        );
+    }
+    Ok(())
+}
+
+/// Fail unless Git accepts `branch` as a new branch name, before `land`
+/// commits anything. The output must equal the input: `--branch` mode
+/// expands `@{-1}` to the previous branch.
+fn check_branch(root: &Path, branch: &str) -> Result<()> {
+    match git::line(root, &["check-ref-format", "--branch", branch]) {
+        Ok(out) if out == branch => Ok(()),
+        _ => bail!("{branch:?} is not a valid branch name; pick another with --branch"),
+    }
 }
 
 fn read_meta(p: &Path) -> Option<Meta> {
@@ -495,7 +519,7 @@ impl Repo {
 
     pub fn spawn(&self, o: &SpawnOpts) -> Result<Spawned> {
         let t0 = Instant::now();
-        check_name(&o.name)?;
+        check_new_name(&o.name)?;
         self.prepare_home()?;
         if o.use_pool && o.exclude.is_empty() && !o.keep_secrets {
             let head = self.resolve(None)?;
@@ -666,6 +690,7 @@ impl Repo {
                     .file_name()
                     .and_then(|n| n.to_str())
                     .is_some_and(|n| self.config.is_secret(n))
+                    && !fsutil::only_certificates(&path.join(r))
             })
             .map(String::from)
             .collect();
@@ -1210,9 +1235,23 @@ impl Repo {
                 return Some("squash-merged".into());
             }
         }
+        // Ask about every local branch at HEAD, not just a checked-out one:
+        // workspaces run detached, and `land --keep` leaves HEAD detached at
+        // the `agent-ws/<name>` branch it created.
         if gh
-            && let Ok(branch) = git::line(&m.path, &["symbolic-ref", "-q", "--short", "HEAD"])
-            && pr_merged_at(&self.root, &branch, head)
+            && let Ok(at) = git::run(
+                &m.path,
+                &[
+                    "for-each-ref",
+                    "--points-at",
+                    head,
+                    "--format=%(refname:short)",
+                    "refs/heads",
+                ],
+            )
+            && at
+                .lines()
+                .any(|branch| pr_merged_at(&self.root, branch, head))
         {
             return Some("pr-merged".into());
         }
@@ -1307,7 +1346,8 @@ impl Repo {
         let mut out = Vec::new();
         for m in self.list()? {
             if m.path.exists() {
-                let c = git::changed_paths(&m.path, &m.base)?;
+                let c = git::changed_paths(&m.path, &m.base)
+                    .with_context(|| format!("workspace {:?}", m.name))?;
                 out.push((m, c));
             }
         }
@@ -1355,6 +1395,7 @@ impl Repo {
             .branch
             .clone()
             .unwrap_or_else(|| format!("agent-ws/{}", o.name));
+        check_branch(&self.root, &branch)?;
         let existing = git::line(
             &self.root,
             &[
@@ -1399,12 +1440,18 @@ impl Repo {
                 "branch {branch} already exists and does not match this workspace; pass --branch NAME or --force-branch"
             );
         }
+        // Overlaps are advice: a workspace Git cannot read must not block
+        // landing this one (`status` reports it).
         let mut overlaps: BTreeMap<String, Vec<String>> = BTreeMap::new();
-        for (other, changed) in self.changes()? {
-            if other.name != o.name {
-                for p in changed.into_iter().filter(|p| files.contains(p)) {
-                    overlaps.entry(p).or_default().push(other.name.clone());
-                }
+        for other in self.list()? {
+            if other.name == o.name || !other.path.exists() {
+                continue;
+            }
+            let Ok(changed) = git::changed_paths(&other.path, &other.base) else {
+                continue;
+            };
+            for p in changed.into_iter().filter(|p| files.contains(p)) {
+                overlaps.entry(p).or_default().push(other.name.clone());
             }
         }
         let commit = if resume {

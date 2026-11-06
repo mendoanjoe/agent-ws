@@ -1197,3 +1197,171 @@ fn p5_spawn_prunes_merged_workspaces_in_the_background() {
     spawn_with_auto_prune("quiet");
     assert!(!home_dir(&e).join("auto-prune.stamp").exists());
 }
+
+#[test]
+fn r1_certificate_files_stay_private_keys_go() {
+    let e = Env::new();
+    fs::write(
+        e.repo.join(".gitignore"),
+        "node_modules/\n.env\n.env.*\n!.env.example\ndist\nout/\next\n.venv/\ncerts/\n",
+    )
+    .unwrap();
+    git(&e.repo, &["commit", "-q", "-am", "ignore venv"]);
+    // certifi's CA bundle: comments and certificates, nothing secret. pip
+    // and requests fail every HTTPS call without it.
+    let bundle = "# Issuer: CN=Example Root\n\
+                  -----BEGIN CERTIFICATE-----\nMIIBszCCAVmgAwIBAgIU\n-----END CERTIFICATE-----\n\n\
+                  # Issuer: CN=Other Root\n\
+                  -----BEGIN CERTIFICATE-----\nMIIBszCCAVmgAwIBAgIV\n-----END CERTIFICATE-----\n";
+    let certifi = e.repo.join(".venv/lib/python3.12/site-packages/certifi");
+    fs::create_dir_all(&certifi).unwrap();
+    fs::write(certifi.join("cacert.pem"), bundle).unwrap();
+    // A certificate with its key, bare keys, and a non-PEM `.key`: secret.
+    fs::create_dir(e.repo.join("certs")).unwrap();
+    fs::write(
+        e.repo.join("certs/dev.pem"),
+        format!("{bundle}-----BEGIN PRIVATE KEY-----\nMIIE\n-----END PRIVATE KEY-----\n"),
+    )
+    .unwrap();
+    fs::write(
+        e.repo.join("certs/dev.key"),
+        "-----BEGIN EC PRIVATE KEY-----\nMHcC\n-----END EC PRIVATE KEY-----\n",
+    )
+    .unwrap();
+    fs::write(e.repo.join("certs/raw.key"), [0x30u8, 0x82, 0x04, 0xa4]).unwrap();
+    fs::write(
+        e.repo.join("node_modules/dep/server.key"),
+        "-----BEGIN RSA PRIVATE KEY-----\nMIIE\n-----END RSA PRIVATE KEY-----\n",
+    )
+    .unwrap();
+
+    let s = e.ok(&["spawn", "w"]);
+    let ws = path_of(&s);
+    assert_eq!(
+        fs::read_to_string(ws.join(".venv/lib/python3.12/site-packages/certifi/cacert.pem"))
+            .unwrap(),
+        bundle,
+        "certificates are public"
+    );
+    assert_eq!(
+        s["secrets_removed"],
+        serde_json::json!([
+            ".env",
+            "certs/dev.key",
+            "certs/dev.pem",
+            "certs/raw.key",
+            "node_modules/dep/server.key"
+        ])
+    );
+}
+
+#[test]
+fn r2_status_leaves_the_workspace_index_alone() {
+    use std::os::unix::fs::MetadataExt;
+    let e = Env::new();
+    let ws = path_of(&e.ok(&["spawn", "w"]));
+    let index = PathBuf::from(git(&ws, &["rev-parse", "--absolute-git-dir"])).join("index");
+    // Same content, new mtime: Git refreshes the index and rewrites it,
+    // taking index.lock, unless told not to. An agent committing at that
+    // moment fails with "index.lock: File exists".
+    let touched = Command::new("touch")
+        .args(["-t", "200101010000"])
+        .arg(ws.join("a.txt"))
+        .status()
+        .unwrap();
+    assert!(touched.success());
+    let before = fs::metadata(&index).unwrap().ino();
+    e.ok(&["status"]);
+    e.ok(&["status", "w"]);
+    assert_eq!(
+        fs::metadata(&index).unwrap().ino(),
+        before,
+        "status must not rewrite the workspace index"
+    );
+}
+
+#[test]
+fn r3_names_and_branches_git_rejects_fail_before_any_commit() {
+    let e = Env::new();
+    for bad in ["fix.lock", "a..b", "v2."] {
+        let err = e.err(&["spawn", bad]);
+        assert!(err.contains("invalid workspace name"), "{bad}: {err}");
+    }
+    assert!(e.ok(&["list"]).as_array().unwrap().is_empty());
+
+    let ws = path_of(&e.ok(&["spawn", "w"]));
+    let base = git(&ws, &["rev-parse", "HEAD"]);
+    fs::write(ws.join("a.txt"), "work\n").unwrap();
+    for bad in ["bad..name", "-x", "HEAD", "has space", "@{-1}"] {
+        let err = e.err(&["land", "w", "-m", "x", &format!("--branch={bad}")]);
+        assert!(err.contains("not a valid branch name"), "{bad}: {err}");
+    }
+    assert_eq!(git(&ws, &["rev-parse", "HEAD"]), base, "no commit was made");
+    let landed = e.ok(&["land", "w", "-m", "x", "--branch", "good"]);
+    assert_eq!(landed["branch"], "good");
+    assert_eq!(
+        git(&e.repo, &["rev-list", "--count", "main..good"]),
+        "1",
+        "exactly one commit"
+    );
+}
+
+#[test]
+fn r4_prune_gh_asks_about_the_branch_land_keep_created() {
+    use std::os::unix::fs::PermissionsExt;
+    let e = Env::new();
+    let ws = path_of(&e.ok(&["spawn", "kept"]));
+    fs::write(ws.join("c.txt"), "see\n").unwrap();
+    let landed = e.ok(&["land", "kept", "-m", "c", "--keep"]);
+    let head = landed["commit"].as_str().unwrap().to_string();
+    // main has not fetched the merge: only GitHub knows the PR was merged.
+    // A stand-in `gh` reports a merged PR from agent-ws/kept at `head`.
+    let bin = e.home.parent().unwrap().join("fake-bin");
+    fs::create_dir(&bin).unwrap();
+    fs::write(
+        bin.join("gh"),
+        "#!/bin/sh\ncase \"$*\" in\n\
+         *'--head agent-ws/kept'*) printf '[{\"headRefOid\":\"%s\"}]' \"$FAKE_GH_HEAD\" ;;\n\
+         *) printf '[]' ;;\nesac\n",
+    )
+    .unwrap();
+    fs::set_permissions(bin.join("gh"), fs::Permissions::from_mode(0o755)).unwrap();
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+    let prune = |extra: &[&str]| -> serde_json::Value {
+        let out = cmd(env!("CARGO_BIN_EXE_agent-ws"), &e.repo)
+            .env("AGENT_WS_HOME", &e.home)
+            .env("AGENT_WS_NO_REFILL", "1")
+            .env("AGENT_WS_NO_AUTO_PRUNE", "1")
+            .env("PATH", &path)
+            .env("FAKE_GH_HEAD", &head)
+            .args(["--json", "prune", "--base", "main", "--min-age-min", "0"])
+            .args(extra)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        serde_json::from_slice(&out.stdout).unwrap()
+    };
+
+    let without = prune(&["--dry-run"]);
+    assert_eq!(names(&without, "kept"), ["kept"]);
+    let with = prune(&["--dry-run", "--gh"]);
+    assert_eq!(names(&with, "pruned"), ["kept"]);
+    assert_eq!(with["pruned"][0]["reason"], "pr-merged");
+}
+
+#[test]
+fn r5_a_broken_workspace_does_not_block_landing_another() {
+    let e = Env::new();
+    let good = path_of(&e.ok(&["spawn", "good"]));
+    let broken = path_of(&e.ok(&["spawn", "broken"]));
+    fs::remove_file(broken.join(".git")).unwrap();
+    fs::write(good.join("a.txt"), "work\n").unwrap();
+    let landed = e.ok(&["land", "good", "-m", "x"]);
+    assert_eq!(landed["files"], 1);
+    // `status` still fails, and says which workspace Git cannot read.
+    assert!(e.err(&["status"]).contains("broken"));
+}

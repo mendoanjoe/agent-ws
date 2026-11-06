@@ -56,9 +56,11 @@ copied block by block only when something writes to it.
 - Not untracked secret files, wherever they are (also inside ignored
   folders): `.env`, `.env.*`, `.dev.vars`, `*.pem`, `*.key`, `*.p12`,
   `id_rsa`, `id_ed25519`, except `.env.example`, `.env.sample` and
-  `.env.template`. Tracked files are never removed. `--keep-secrets` keeps
-  them, including untracked secrets that are not ignored; other untracked
-  files are still left out.
+  `.env.template`. Tracked files are never removed. Files holding only PEM
+  certificates (no key), such as certifi's `cacert.pem` CA bundle in a
+  Python `.venv`, are public and stay. `--keep-secrets` keeps them,
+  including untracked secrets that are not ignored; other untracked files
+  are still left out.
 - Checked-out submodules with their own copy of the submodule's git dir, at
   the commit the base records. Commits made inside a submodule stay in the
   workspace; `land` records the new submodule commit in the parent.
@@ -106,8 +108,15 @@ contents per file, not per shared disk block.
   trailers (empty if the agent already committed everything). It refuses an
   existing branch unless the branch is already at the workspace's HEAD (an
   interrupted land) or was landed earlier by the same workspace (`--keep`),
-  which then moves forward. Changed files count every path touched: a rename
-  is two, so deleting a file another workspace edits is an overlap.
+  which then moves forward. The branch name is checked before anything is
+  committed, and `spawn` refuses names that cannot be part of the branch
+  `agent-ws/NAME` (`..`, a trailing `.` or `.lock`). Changed files count
+  every path touched: a rename is two, so deleting a file another workspace
+  edits is an overlap. A workspace Git cannot read is left out of `land`'s
+  overlap check instead of failing it.
+- `status`, `prune` and `gc` read workspaces with `git --no-optional-locks`,
+  so a coordinator polling them never takes the `index.lock` an agent needs
+  to commit.
 - `drop` renames the tree into `.trash` and deletes it with a background
   `rm -rf` in its own process group, so closing the terminal does not stop
   it. Each `drop` restarts deletes older than 10 minutes.
@@ -143,7 +152,7 @@ flowchart TD
     G -- yes --> P2[drop: merged]
     G -- no --> H{every path changed since the fork point<br/>equal in base?}
     H -- yes --> P3[drop: squash-merged]
-    H -- no --> I{--gh and merged PR<br/>from its branch at HEAD?}
+    H -- no --> I{--gh and merged PR<br/>from a branch at HEAD?}
     I -- yes --> P4[drop: pr-merged]
     I -- no --> K5[keep: commits not in base]
 ```

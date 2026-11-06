@@ -23,11 +23,15 @@ pub fn line(dir: &Path, args: &[&str]) -> Result<String> {
 /// Every path a workspace touched since `base`. A rename touches two paths
 /// (the old one is removed), so rename detection is off: removing a file
 /// another workspace edits is an overlap too.
+///
+/// Read-only: a coordinator polls this while agents commit, and a plain
+/// `git status` rewrites the index under `index.lock`, failing their commits.
 pub fn changed_paths(dir: &Path, base: &str) -> Result<Vec<String>> {
     let mut paths = Vec::new();
     let out = run(
         dir,
         &[
+            "--no-optional-locks",
             "status",
             "--porcelain=v1",
             "-z",
