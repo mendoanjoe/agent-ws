@@ -332,7 +332,7 @@ fn claude_cmd(json: bool, cmd: ClaudeCmd) -> Result<i32> {
                         false => println!("agent-ws hooks already in {}", path.display()),
                     }
                     println!(
-                        "Claude Code worktrees (--worktree, isolation: \"worktree\") now come from agent-ws; it needs `{}` on its PATH",
+                        "Claude Code worktrees (--worktree, isolation: \"worktree\") now come from agent-ws; Claude Code runs `{}`, so `agent-ws` must be on its PATH",
                         claude::HOOK_COMMAND
                     );
                     if matches!(scope, ScopeArg::Local) && !git_ignores(&path) {
