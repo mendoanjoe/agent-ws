@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>agent-ws</title>
+    <link rel="stylesheet" href="/src/styles.css" />
+    <script type="module" src="/src/main.ts"></script>
+  </head>
+  <body>
+    <aside id="sidebar">
+      <header class="brand">agent-ws</header>
+      <nav id="repos" aria-label="Repositories"></nav>
+      <footer id="sidebar-note"></footer>
+    </aside>
+    <main id="main">
+      <header id="repo-header">
+        <div>
+          <h1 id="repo-name"></h1>
+          <p id="repo-path" class="muted"></p>
+        </div>
+        <div class="actions">
+          <button id="prune" type="button" title="Drop workspaces whose work is merged">Prune merged…</button>
+          <button id="refresh" type="button" title="Refresh now">Refresh</button>
+        </div>
+      </header>
+      <section id="banner" hidden></section>
+      <section id="table-wrap">
+        <table id="workspaces">
+          <thead>
+            <tr>
+              <th>Name</th>
+              <th class="num">Age</th>
+              <th class="num">Port</th>
+              <th>Last exec</th>
+              <th>Changes</th>
+              <th class="num">Procs</th>
+              <th class="num">Real disk</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+        <p id="empty" class="muted" hidden></p>
+      </section>
+      <section id="detail" hidden>
+        <header>
+          <div>
+            <h2 id="ws-name"></h2>
+            <p id="ws-meta" class="muted"></p>
+          </div>
+          <div class="actions">
+            <button data-open="files" type="button">Folder</button>
+            <button data-open="editor" type="button">Editor</button>
+            <button data-open="terminal" type="button">Terminal</button>
+            <button id="open-port" type="button" hidden></button>
+            <button id="land" type="button" class="primary">Land…</button>
+            <button id="drop" type="button" class="danger">Drop…</button>
+          </div>
+        </header>
+        <div class="tabs" role="tablist">
+          <button role="tab" data-tab="diff" aria-selected="true" type="button">Diff</button>
+          <button role="tab" data-tab="log" aria-selected="false" type="button">Log</button>
+        </div>
+        <div id="tab-diff" class="tab"></div>
+        <div id="tab-log" class="tab" hidden><pre id="log"></pre></div>
+      </section>
+    </main>
+    <dialog id="dialog">
+      <form method="dialog" id="dialog-form">
+        <h3 id="dialog-title"></h3>
+        <div id="dialog-body"></div>
+        <menu>
+          <button value="cancel" type="submit" formnovalidate>Cancel</button>
+          <button value="ok" type="submit" id="dialog-ok" class="primary"></button>
+        </menu>
+      </form>
+    </dialog>
+    <div id="toast" role="status" hidden></div>
+  </body>
+</html>

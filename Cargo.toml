@@ -30,3 +30,10 @@ toml = { version = "1.1.8", default-features = false, features = ["parse", "serd
 
 [dev-dependencies]
 tempfile = "3.27.0"
+
+# The desktop app lives in desktop/. Plain `cargo build` and `cargo test` stay
+# on the CLI; build the app with `cargo build -p agent-ws-desktop` or `npm run
+# tauri build` in desktop/. The published crate holds only `include` above.
+[workspace]
+members = ["desktop/src-tauri"]
+default-members = ["."]

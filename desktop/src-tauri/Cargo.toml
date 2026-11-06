@@ -1,0 +1,18 @@
+[package]
+name = "agent-ws-desktop"
+version = "0.1.0"
+description = "agent-ws in a window and the menu bar: workspaces, diffs, land and drop"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/mendoanjoe/agent-ws"
+publish = false
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+agent-ws = { path = "../.." }
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-notification = "2"

@@ -1,0 +1,58 @@
+name: Desktop
+
+# The desktop app (desktop/): type-check and build the window, lint the Rust
+# side, and bundle it, on macOS and Linux. Runs when the app or the library
+# it uses changes.
+on:
+  push:
+    branches: [master]
+    paths:
+      - "desktop/**"
+      - "src/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/desktop.yml"
+  pull_request:
+    paths:
+      - "desktop/**"
+      - "src/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/desktop.yml"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: desktop (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: macos-latest, bundles: app }
+          - { os: ubuntu-latest, bundles: deb }
+    defaults:
+      run:
+        working-directory: desktop
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libxdo-dev
+      - run: npm ci
+      - run: npm run build
+      - run: cargo clippy -p agent-ws-desktop --all-targets -- -D warnings
+      - run: npx tauri build --debug --bundles ${{ matrix.bundles }}
