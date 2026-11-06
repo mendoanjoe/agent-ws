@@ -1397,3 +1397,76 @@ fn r6_worktree_registry_changes_take_turns() {
     assert!(status.success());
     assert_eq!(git(&e.repo, &["worktree", "list"]).lines().count(), 1);
 }
+
+#[test]
+fn s1_diff_shows_commits_edits_and_new_files_without_touching_the_index() {
+    use std::os::unix::fs::MetadataExt;
+    let e = Env::new();
+    let ws = path_of(&e.ok(&["spawn", "w"]));
+    fs::write(ws.join("a.txt"), "one\ntwo\n").unwrap();
+    git(&ws, &["commit", "-q", "-am", "edit a"]);
+    fs::write(ws.join("b.txt"), "bee\nbuzz\n").unwrap();
+    fs::write(ws.join("new.txt"), "fresh\n").unwrap();
+    fs::remove_file(ws.join(".env.example")).unwrap();
+    let index = PathBuf::from(git(&ws, &["rev-parse", "--absolute-git-dir"])).join("index");
+    let before = fs::metadata(&index).unwrap().ino();
+
+    let files = e.ok(&["diff", "w"]);
+    assert_eq!(
+        files,
+        serde_json::json!([
+            {"path": ".env.example", "status": "D", "added": 0, "deleted": 1},
+            {"path": "a.txt", "status": "M", "added": 1, "deleted": 0},
+            {"path": "b.txt", "status": "M", "added": 1, "deleted": 0},
+            {"path": "new.txt", "status": "A", "added": 1, "deleted": 0},
+        ])
+    );
+    assert_eq!(e.ok(&["diff", "w", "new.txt"]).as_array().unwrap().len(), 1);
+    let patch = String::from_utf8(e.run(&["diff", "w"]).stdout).unwrap();
+    assert!(
+        patch.contains("+two") && patch.contains("+fresh"),
+        "{patch}"
+    );
+    assert_eq!(
+        fs::metadata(&index).unwrap().ino(),
+        before,
+        "the workspace index is untouched"
+    );
+    assert!(
+        git(&ws, &["status", "--porcelain"]).contains("?? new.txt"),
+        "nothing was staged"
+    );
+}
+
+#[test]
+fn s2_status_tells_conflicts_from_overlaps_that_merge_cleanly() {
+    let e = Env::new();
+    fs::write(e.repo.join("f.txt"), "1\n2\n3\n4\n5\n6\n7\n8\n").unwrap();
+    git(&e.repo, &["add", "f.txt"]);
+    git(&e.repo, &["commit", "-q", "-m", "f"]);
+    let top = path_of(&e.ok(&["spawn", "top"]));
+    let bottom = path_of(&e.ok(&["spawn", "bottom"]));
+    let clash = path_of(&e.ok(&["spawn", "clash"]));
+    // Uncommitted and committed edits both count.
+    fs::write(top.join("f.txt"), "one\n2\n3\n4\n5\n6\n7\n8\n").unwrap();
+    fs::write(bottom.join("f.txt"), "1\n2\n3\n4\n5\n6\n7\neight\n").unwrap();
+    git(&bottom, &["commit", "-q", "-am", "bottom"]);
+    fs::write(clash.join("f.txt"), "1\n2\n3\n4\n5\n6\n7\nEIGHT\n").unwrap();
+
+    let s = e.ok(&["status"]);
+    assert_eq!(
+        s["overlaps"]["f.txt"],
+        serde_json::json!(["bottom", "clash", "top"])
+    );
+    assert_eq!(
+        s["conflicts"],
+        serde_json::json!([{"workspaces": ["bottom", "clash"], "paths": ["f.txt"]}])
+    );
+    let human = String::from_utf8(e.run(&["status"]).stdout).unwrap();
+    assert!(human.contains("CONFLICT bottom + clash: f.txt"), "{human}");
+    // Polling adds no objects once nothing changes.
+    let count = || git(&e.repo, &["count-objects"]);
+    let before = count();
+    e.ok(&["status"]);
+    assert_eq!(count(), before);
+}

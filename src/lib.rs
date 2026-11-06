@@ -16,7 +16,7 @@ pub mod git;
 use anyhow::{Context, Result, bail};
 use config::Config;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -78,10 +78,59 @@ pub struct Meta {
     pub key: String,
     #[serde(default)]
     pub notes: Notes,
+    /// Port slot, unique among workspaces: `exec` and hooks get
+    /// `PORT = port_base + slot * port_step`. Absent in older records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slot: Option<u32>,
+    /// Branch checked out in the workspace (`spawn --branch`, Claude Code
+    /// worktrees); empty when HEAD is detached.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub branch: String,
+    /// What created it: empty for the command line, `claude` for Claude
+    /// Code's WorktreeCreate hook.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub origin: String,
 }
 
 fn ready() -> String {
     "ready".into()
+}
+
+/// The last `exec` in a workspace, kept in `runs/<name>.json`.
+#[derive(Serialize, Deserialize, Clone)]
+pub struct Run {
+    pub command: Vec<String>,
+    pub pid: u32,
+    pub pid_start: u64,
+    pub started: u64,
+    /// Unset while the command runs, or when agent-ws was killed first.
+    pub ended: Option<u64>,
+    pub exit_code: Option<i32>,
+}
+
+/// One changed path in `diff --json`.
+#[derive(Serialize)]
+pub struct FileChange {
+    pub path: String,
+    /// Git's status letter: `A`dded, `M`odified, `D`eleted, `T`ype changed.
+    pub status: String,
+    /// Lines added and deleted; absent for binary files.
+    pub added: Option<u64>,
+    pub deleted: Option<u64>,
+}
+
+/// A workspace as it is right now, as a tree object (see `Repo::snapshot`).
+pub struct Snapshot {
+    pub path: PathBuf,
+    pub base: String,
+    pub tree: String,
+}
+
+/// Two workspaces whose changes conflict when both are merged.
+#[derive(Serialize)]
+pub struct Conflict {
+    pub workspaces: Vec<String>,
+    pub paths: Vec<String>,
 }
 
 /// What spawning found and fixed in a workspace.
@@ -211,6 +260,9 @@ pub struct Status {
     pub workspaces: Vec<WsStatus>,
     /// Paths changed in more than one workspace, with the workspaces involved.
     pub overlaps: BTreeMap<String, Vec<String>>,
+    /// Overlapping workspaces whose changes do not merge cleanly. `null`
+    /// when Git is older than 2.38 and cannot tell.
+    pub conflicts: Option<Vec<Conflict>>,
 }
 
 #[derive(Serialize)]
@@ -544,6 +596,9 @@ impl Repo {
             pid_start: own_start(),
             key: String::new(),
             notes: Notes::default(),
+            slot: None,
+            branch: String::new(),
+            origin: String::new(),
         };
         write_record(&rec, &meta, true)?;
         match self.create(o, &path, t0) {
@@ -812,6 +867,9 @@ impl Repo {
                 pid_start: own_start(),
                 key: key.clone(),
                 notes: Notes::default(),
+                slot: None,
+                branch: String::new(),
+                origin: String::new(),
             };
             write_record(&rec, &meta, true)?;
             match self.create(
@@ -1083,6 +1141,9 @@ impl Repo {
             pid_start: 0,
             key: String::new(),
             notes: Notes::default(),
+            slot: None,
+            branch: String::new(),
+            origin: String::new(),
         };
         write_record(&self.meta_path(name), &meta, true)
     }
@@ -1385,6 +1446,7 @@ impl Repo {
                 by_path.entry(p.clone()).or_default().push(m.name.clone());
             }
         }
+        let metas: Vec<Meta> = all.iter().map(|(m, _)| m.clone()).collect();
         let workspaces: Vec<WsStatus> = all
             .into_iter()
             .filter(|(m, _)| only.is_none_or(|n| n == m.name))
@@ -1400,11 +1462,116 @@ impl Repo {
         {
             bail!("no workspace named {n:?}");
         }
-        let overlaps = by_path.into_iter().filter(|(_, v)| v.len() > 1).collect();
+        let overlaps: BTreeMap<String, Vec<String>> =
+            by_path.into_iter().filter(|(_, v)| v.len() > 1).collect();
+        let conflicts = self.conflicts(&metas, &overlaps);
         Ok(Status {
             workspaces,
             overlaps,
+            conflicts,
         })
+    }
+
+    /// Which overlapping workspaces would conflict if both were merged.
+    /// Each one is snapshotted as a commit on its HEAD and `merge-tree`
+    /// merges the pair in memory; nothing in the workspaces changes. A
+    /// workspace Git cannot snapshot is left out.
+    fn conflicts(
+        &self,
+        metas: &[Meta],
+        overlaps: &BTreeMap<String, Vec<String>>,
+    ) -> Option<Vec<Conflict>> {
+        let mut pairs: BTreeSet<(String, String)> = BTreeSet::new();
+        for names in overlaps.values() {
+            for (i, a) in names.iter().enumerate() {
+                for b in &names[i + 1..] {
+                    let (a, b) = if a < b { (a, b) } else { (b, a) };
+                    pairs.insert((a.clone(), b.clone()));
+                }
+            }
+        }
+        let mut commits: HashMap<String, Option<String>> = HashMap::new();
+        let mut commit = |name: &str| -> Option<String> {
+            commits
+                .entry(name.to_string())
+                .or_insert_with(|| {
+                    let m = metas.iter().find(|m| m.name == name)?;
+                    let tree = git::snapshot_tree(&m.path, &self.scratch()).ok()?;
+                    let head = git::line(&m.path, &["rev-parse", "HEAD"]).ok()?;
+                    git::snapshot_commit(&m.path, &tree, &head).ok()
+                })
+                .clone()
+        };
+        let mut out = Vec::new();
+        for (a, b) in pairs {
+            let (Some(ca), Some(cb)) = (commit(&a), commit(&b)) else {
+                continue;
+            };
+            match git::merge_conflicts(&self.root, &ca, &cb) {
+                Ok(Some(paths)) if !paths.is_empty() => out.push(Conflict {
+                    workspaces: vec![a, b],
+                    paths,
+                }),
+                Ok(Some(_)) | Err(_) => {}
+                Ok(None) => return None,
+            }
+        }
+        Some(out)
+    }
+
+    /// Temporary index files for snapshots.
+    fn scratch(&self) -> PathBuf {
+        self.dir.join("tmp")
+    }
+
+    /// A workspace's current state as a tree: its commits, uncommitted edits
+    /// and new files, read without touching its index.
+    pub fn snapshot(&self, name: &str) -> Result<Snapshot> {
+        let m = self.meta(name)?;
+        let tree = git::snapshot_tree(&m.path, &self.scratch())?;
+        Ok(Snapshot {
+            path: m.path,
+            base: m.base,
+            tree,
+        })
+    }
+
+    /// Files a workspace changed since its base, with line counts, limited
+    /// to `paths` when given.
+    pub fn diff_files(&self, name: &str, paths: &[String]) -> Result<Vec<FileChange>> {
+        let s = self.snapshot(name)?;
+        let run = |what: &str| {
+            let mut args = vec!["diff", "--no-renames", "--no-ext-diff", "-z", what];
+            args.extend([s.base.as_str(), s.tree.as_str(), "--"]);
+            args.extend(paths.iter().map(String::as_str));
+            git::run(&s.path, &args)
+        };
+        // `<status>\0<path>\0` per file.
+        let mut files: BTreeMap<String, FileChange> = BTreeMap::new();
+        let names = run("--name-status")?;
+        let mut it = names.split('\0').filter(|x| !x.is_empty());
+        while let (Some(status), Some(path)) = (it.next(), it.next()) {
+            files.insert(
+                path.to_string(),
+                FileChange {
+                    path: path.to_string(),
+                    status: status.to_string(),
+                    added: None,
+                    deleted: None,
+                },
+            );
+        }
+        // `<added>\t<deleted>\t<path>\0`, `-` for binary files.
+        for rec in run("--numstat")?.split('\0').filter(|x| !x.is_empty()) {
+            let mut f = rec.splitn(3, '\t');
+            if let (Some(a), Some(d), Some(p)) = (f.next(), f.next(), f.next())
+                && let Some(c) = files.get_mut(p)
+            {
+                c.added = a.parse().ok();
+                c.deleted = d.parse().ok();
+            }
+        }
+        Ok(files.into_values().collect())
     }
 
     pub fn land(&self, o: &LandOpts) -> Result<Landed> {

@@ -36,8 +36,18 @@ enum Cmd {
     },
     /// List workspaces.
     List,
-    /// Show changed files per workspace and files changed in more than one.
+    /// Show changed files per workspace, files changed in more than one, and
+    /// which of those would conflict when merged.
     Status { name: Option<String> },
+    /// Show what a workspace changed since its base, new files included.
+    Diff {
+        name: String,
+        /// Changed files with line counts instead of the patch.
+        #[arg(long)]
+        stat: bool,
+        /// Limit the diff to these paths.
+        paths: Vec<String>,
+    },
     /// Print a workspace path (for `cd "$(agent-ws path NAME)"`).
     Path { name: String },
     /// Commit the workspace changes to a branch, then remove the workspace.
@@ -243,7 +253,45 @@ fn run(cli: Cli) -> Result<()> {
             for (p, names) in &s.overlaps {
                 println!("OVERLAP {p}: {}", names.join(", "));
             }
+            match &s.conflicts {
+                Some(conflicts) => {
+                    for c in conflicts {
+                        println!(
+                            "CONFLICT {}: {}",
+                            c.workspaces.join(" + "),
+                            c.paths.join(", ")
+                        );
+                    }
+                }
+                None if !s.overlaps.is_empty() => {
+                    println!("(conflict check needs Git 2.38 or later)")
+                }
+                None => {}
+            }
         }),
+        Cmd::Diff { name, stat, paths } => {
+            if cli.json {
+                print(true, &repo.diff_files(&name, &paths)?, |_| {})
+            } else {
+                // Git pages and colours the patch as it does for `git diff`.
+                let s = repo.snapshot(&name)?;
+                let mut git = std::process::Command::new("git");
+                git.arg("-C").arg(&s.path).arg("diff");
+                if stat {
+                    git.arg("--stat");
+                }
+                let status = git
+                    .arg(&s.base)
+                    .arg(&s.tree)
+                    .arg("--")
+                    .args(&paths)
+                    .status()?;
+                if !status.success() {
+                    anyhow::bail!("git diff failed ({status})");
+                }
+                Ok(())
+            }
+        }
         Cmd::Path { name } => {
             let path = repo.meta(&name)?.path;
             print(cli.json, &serde_json::json!({ "path": path }), |_| {
