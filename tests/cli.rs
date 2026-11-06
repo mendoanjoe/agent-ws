@@ -1937,3 +1937,83 @@ fn s10_completions_need_no_repository() {
         );
     }
 }
+
+#[test]
+fn d1_repos_lists_every_repository_with_state() {
+    let e = Env::new();
+    e.ok(&["spawn", "w"]);
+    // From outside any repository, as the desktop app asks.
+    let repos = || {
+        let out = cmd(env!("CARGO_BIN_EXE_agent-ws"), e.home.parent().unwrap())
+            .env("AGENT_WS_HOME", &e.home)
+            .args(["--json", "repos"])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        serde_json::from_slice::<serde_json::Value>(&out.stdout).unwrap()
+    };
+    let r = repos();
+    assert_eq!(r.as_array().unwrap().len(), 1);
+    assert_eq!(r[0]["root"], e.repo.to_str().unwrap());
+    assert_eq!(r[0]["workspaces"], 1);
+    // State written before repo.json existed is found through a workspace.
+    fs::remove_file(home_dir(&e).join("repo.json")).unwrap();
+    assert_eq!(repos()[0]["root"], e.repo.to_str().unwrap());
+}
+
+#[test]
+fn d2_exec_keeps_a_log_of_the_output() {
+    let e = Env::new();
+    e.ok(&["spawn", "w"]);
+    // Test stdout is a pipe, not a terminal: the log is on by default.
+    let out = e.run(&[
+        "exec",
+        "w",
+        "--",
+        "sh",
+        "-c",
+        "echo out; echo err >&2; exit 2",
+    ]);
+    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "out\n",
+        "still printed"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stderr), "err\n");
+    let log = e.run(&["log", "w"]);
+    let text = String::from_utf8_lossy(&log.stdout);
+    assert!(text.contains("out\n") && text.contains("err\n"), "{text}");
+    let long = e.ok(&["list", "--long", "--no-disk"]);
+    assert_eq!(long[0]["run"]["log"], true);
+    assert_eq!(
+        long[0]["private_bytes"],
+        serde_json::Value::Null,
+        "--no-disk"
+    );
+    assert!(e.ok(&["list", "--long"])[0]["private_bytes"].is_u64());
+    e.ok(&["spawn", "quiet"]);
+    assert!(e.err(&["log", "quiet"]).contains("no log"));
+}
+
+#[test]
+fn d3_gc_keeps_the_runs_of_names_with_dots() {
+    let e = Env::new();
+    e.ok(&["spawn", "v1.2"]);
+    assert!(e.run(&["exec", "v1.2", "--", "true"]).status.success());
+    e.ok(&["gc"]);
+    let long = e.ok(&["list", "--long", "--no-disk"]);
+    assert_eq!(long[0]["run"]["state"], "exited", "gc kept v1.2.json");
+    assert!(e.run(&["log", "v1.2"]).status.success(), "and v1.2.log");
+    e.ok(&["drop", "v1.2"]);
+    assert!(
+        fs::read_dir(home_dir(&e).join("runs"))
+            .unwrap()
+            .next()
+            .is_none()
+    );
+}

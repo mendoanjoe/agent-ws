@@ -55,16 +55,27 @@ enum Cmd {
         /// With --spawn: commit to start from (default HEAD).
         #[arg(long, requires = "spawn")]
         base: Option<String>,
+        /// Also keep the output in a log (`agent-ws log NAME`). On by default
+        /// when stdout is not a terminal; interactive agents need one.
+        #[arg(long)]
+        log: bool,
         /// The command and its arguments, after `--`.
         #[arg(last = true, required = true)]
         command: Vec<String>,
     },
+    /// Print the output of the last `exec --log` in a workspace.
+    Log { name: String },
     /// List workspaces.
     List {
         /// Also age, port, changes, processes inside, last exec, real disk use.
         #[arg(short, long)]
         long: bool,
+        /// With --long: skip the real disk use, which reads every file.
+        #[arg(long, requires = "long")]
+        no_disk: bool,
     },
+    /// List every repository agent-ws keeps workspaces for.
+    Repos,
     /// Show changed files per workspace, files changed in more than one, and
     /// which of those would conflict when merged.
     Status { name: Option<String> },
@@ -304,6 +315,12 @@ fn run(cli: Cli) -> Result<i32> {
             Ok(0)
         }
         Cmd::Claude { cmd } => claude_cmd(cli.json, cmd),
+        Cmd::Repos => print(cli.json, &agent_ws::known_repos()?, |repos| {
+            for r in repos {
+                let name = r.root.file_name().unwrap_or_default().to_string_lossy();
+                println!("{name:20} {:>3}  {}", r.workspaces, r.root.display());
+            }
+        }),
         cmd => {
             let repo = Repo::discover(&std::env::current_dir()?)?;
             repo_cmd(cli.json, &repo, cmd)
@@ -481,6 +498,7 @@ fn repo_cmd(json: bool, repo: &Repo, cmd: Cmd) -> Result<i32> {
             name,
             spawn,
             base,
+            log,
             command,
         } => {
             if spawn && !repo.exists(&name) {
@@ -494,14 +512,25 @@ fn repo_cmd(json: bool, repo: &Repo, cmd: Cmd) -> Result<i32> {
                 prune_in_background(repo);
                 eprintln!("agent-ws: spawned {}  {}", s.name, s.path.display());
             }
-            repo.exec(&name, &command)
+            use std::io::IsTerminal;
+            repo.exec(&name, &command, log || !std::io::stdout().is_terminal())
         }
-        Cmd::List { long: false } => print(json, &repo.list()?, |l| {
+        Cmd::Log { name } => match repo.run_log(&name, 1 << 20)? {
+            Some(text) => {
+                print!("{text}");
+                Ok(0)
+            }
+            None => bail!("no log for {name:?}: run `agent-ws exec {name} --log -- …`"),
+        },
+        Cmd::List { long: false, .. } => print(json, &repo.list()?, |l| {
             for m in l {
                 println!("{:20} {}  {}", m.name, short(&m.base), m.path.display());
             }
         }),
-        Cmd::List { long: true } => print(json, &repo.list_long()?, |l| {
+        Cmd::List {
+            long: true,
+            no_disk,
+        } => print(json, &repo.list_long(!no_disk)?, |l| {
             println!(
                 "{:20} {:>4} {:>5}  {:10} {:>5}  {:12} {:>9}",
                 "NAME", "AGE", "PORT", "CHANGES", "PROCS", "LAST EXEC", "REAL"
@@ -540,7 +569,7 @@ fn repo_cmd(json: bool, repo: &Repo, cmd: Cmd) -> Result<i32> {
                     changes,
                     w.processes.len(),
                     run,
-                    human(w.private_bytes)
+                    w.private_bytes.map_or("-".into(), human)
                 );
             }
         }),
@@ -792,6 +821,6 @@ fn repo_cmd(json: bool, repo: &Repo, cmd: Cmd) -> Result<i32> {
                 println!("trusted pre_land: {c}");
             }
         }),
-        Cmd::Completions { .. } | Cmd::Claude { .. } => unreachable!("handled in run"),
+        Cmd::Completions { .. } | Cmd::Claude { .. } | Cmd::Repos => unreachable!("handled in run"),
     }
 }

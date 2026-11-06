@@ -118,6 +118,9 @@ pub struct Run {
     /// Unset while the command runs, or when agent-ws was killed first.
     pub ended: Option<u64>,
     pub exit_code: Option<i32>,
+    /// Its output is in `runs/<name>.log` (see `Repo::run_log`).
+    #[serde(default)]
+    pub log: bool,
 }
 
 /// One changed path in `diff --json`.
@@ -382,8 +385,8 @@ pub struct WsInfo {
     /// Processes whose current directory is inside (agents, shells).
     pub processes: Vec<u32>,
     pub run: Option<RunInfo>,
-    /// Bytes only this workspace holds.
-    pub private_bytes: u64,
+    /// Bytes only this workspace holds; `null` unless asked for.
+    pub private_bytes: Option<u64>,
 }
 
 /// The last `exec` and whether it still runs.
@@ -393,6 +396,62 @@ pub struct RunInfo {
     pub run: Run,
     /// `running`, `exited`, or `interrupted` (agent-ws was killed first).
     pub state: String,
+}
+
+/// A repository agent-ws keeps state for.
+#[derive(Serialize)]
+pub struct KnownRepo {
+    /// The main checkout.
+    pub root: PathBuf,
+    /// Its state folder under `~/.agent-ws`.
+    pub dir: PathBuf,
+    /// Workspaces that finished spawning.
+    pub workspaces: usize,
+}
+
+/// Every repository with state under `~/.agent-ws` (or `AGENT_WS_HOME`)
+/// whose checkout still exists, by name. State folders written before
+/// `repo.json` existed are recognised by asking Git about one of their
+/// workspaces.
+pub fn known_repos() -> Result<Vec<KnownRepo>> {
+    let mut out = Vec::new();
+    for e in std::fs::read_dir(home()?).into_iter().flatten().flatten() {
+        let dir = e.path();
+        if !dir.join("meta").is_dir() {
+            continue;
+        }
+        let noted = std::fs::read(dir.join("repo.json"))
+            .ok()
+            .and_then(|r| serde_json::from_slice::<serde_json::Value>(&r).ok())
+            .and_then(|v| v["root"].as_str().map(PathBuf::from));
+        let root = noted.or_else(|| {
+            read_records(&dir.join("meta"), ".json")
+                .into_iter()
+                .find(|(_, m)| m.path.exists())
+                .and_then(|(_, m)| {
+                    git::line(
+                        &m.path,
+                        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+                    )
+                    .ok()
+                })
+                .and_then(|common| Path::new(&common).parent().map(Path::to_path_buf))
+        });
+        let Some(root) = root.filter(|r| r.join(".git").exists()) else {
+            continue;
+        };
+        let workspaces = read_records(&dir.join("meta"), ".json")
+            .into_iter()
+            .filter(|(_, m)| m.state == "ready")
+            .count();
+        out.push(KnownRepo {
+            root,
+            dir,
+            workspaces,
+        });
+    }
+    out.sort_by(|a, b| a.root.file_name().cmp(&b.root.file_name()));
+    Ok(out)
 }
 
 fn home() -> Result<PathBuf> {
@@ -610,6 +669,17 @@ impl Repo {
     fn prepare_home(&self) -> Result<()> {
         for d in ["meta", "pool", "ws", ".trash"] {
             std::fs::create_dir_all(self.dir.join(d))?;
+        }
+        // The folder name holds only the repository's name and a hash: note
+        // where it lives, so `known_repos` (and the desktop app) find it.
+        let note = self.dir.join("repo.json");
+        let root = serde_json::json!({ "root": self.root });
+        if std::fs::read(&note)
+            .ok()
+            .and_then(|r| serde_json::from_slice(&r).ok())
+            != Some(root.clone())
+        {
+            write_json(&note, &root)?;
         }
         // Keep Spotlight from indexing every new tree, and Time Machine from
         // backing up clones at their full logical size. `tmutil` can take
@@ -1494,9 +1564,14 @@ impl Repo {
             .flatten()
             .flatten()
         {
+            // `<name>.json`, `<name>.log`, or `<name>.tmp.<pid>` from a write
+            // that was cut short. Names may hold dots themselves.
             let file = e.file_name().to_string_lossy().into_owned();
-            let name = file.split('.').next().unwrap_or_default();
-            if !self.meta_path(name).exists() {
+            let name = file
+                .strip_suffix(".json")
+                .or_else(|| file.strip_suffix(".log"))
+                .or_else(|| file.rsplit_once(".tmp.").map(|(n, _)| n));
+            if name.is_some_and(|n| !self.meta_path(n).exists()) {
                 let _ = std::fs::remove_file(e.path());
             }
         }
@@ -2135,6 +2210,7 @@ impl Repo {
         self.discard(&m.path)?;
         std::fs::remove_file(self.meta_path(name))?;
         let _ = std::fs::remove_file(self.run_path(name));
+        let _ = std::fs::remove_file(self.log_path(name));
         // The branch `spawn --branch` made holds nothing until it moves.
         if !m.branch.is_empty() && self.branch_tip(&m.branch).as_deref() == Some(m.base.as_str()) {
             let _ = git::run(&self.root, &["branch", "-q", "-D", &m.branch]);
@@ -2148,8 +2224,67 @@ impl Repo {
         self.dir.join("runs").join(format!("{name}.json"))
     }
 
+    fn log_path(&self, name: &str) -> PathBuf {
+        self.dir.join("runs").join(format!("{name}.log"))
+    }
+
     fn read_run(&self, name: &str) -> Option<Run> {
         serde_json::from_slice(&std::fs::read(self.run_path(name)).ok()?).ok()
+    }
+
+    /// The last `exec` in a workspace and whether it still runs.
+    pub fn run_info(&self, name: &str) -> Option<RunInfo> {
+        let run = self.read_run(name)?;
+        let state = match run.ended {
+            Some(_) => "exited",
+            None if pid_alive(run.pid, run.pid_start) => "running",
+            None => "interrupted",
+        };
+        Some(RunInfo {
+            state: state.into(),
+            run,
+        })
+    }
+
+    /// The last `exec` of every workspace that has one. Cheap: no Git.
+    pub fn runs(&self) -> Result<BTreeMap<String, RunInfo>> {
+        Ok(self
+            .list()?
+            .into_iter()
+            .filter_map(|m| Some((m.name.clone(), self.run_info(&m.name)?)))
+            .collect())
+    }
+
+    /// The end of the output of the last `exec --log`, at most `max` bytes;
+    /// `None` when it kept no log.
+    pub fn run_log(&self, name: &str, max: u64) -> Result<Option<String>> {
+        use std::io::{Read, Seek, SeekFrom};
+        check_name(name)?;
+        let mut f = match std::fs::File::open(self.log_path(name)) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        let len = f.metadata()?.len();
+        f.seek(SeekFrom::Start(len.saturating_sub(max)))?;
+        let mut raw = Vec::new();
+        f.read_to_end(&mut raw)?;
+        Ok(Some(String::from_utf8_lossy(&raw).into_owned()))
+    }
+
+    /// `diff` as text: the patch from the base to the workspace as it is now.
+    pub fn diff_patch(&self, name: &str, paths: &[String]) -> Result<String> {
+        let s = self.snapshot(name)?;
+        let mut args = vec![
+            "diff",
+            "--no-color",
+            "--no-ext-diff",
+            &s.base,
+            &s.tree,
+            "--",
+        ];
+        args.extend(paths.iter().map(String::as_str));
+        git::run(&s.path, &args)
     }
 
     /// Keep a run record, unless the workspace was dropped meanwhile.
@@ -2164,16 +2299,36 @@ impl Repo {
     /// it, and keep how it ended for `list --long`. Ctrl-C reaches the
     /// command; agent-ws stays to record the result. Returns the exit code,
     /// 128 + the signal number when the command was killed.
-    pub fn exec(&self, name: &str, command: &[String]) -> Result<i32> {
+    pub fn exec(&self, name: &str, command: &[String], log: bool) -> Result<i32> {
         use std::os::unix::process::ExitStatusExt;
+        use std::process::Stdio;
+        use std::sync::{Arc, Mutex};
         let m = self.meta(name)?;
         let (prog, args) = command.split_first().context("no command given")?;
-        let mut child = std::process::Command::new(prog)
-            .args(args)
-            .current_dir(&m.path)
-            .envs(self.env(&m))
-            .spawn()
-            .with_context(|| format!("run {prog}"))?;
+        let mut cmd = std::process::Command::new(prog);
+        cmd.args(args).current_dir(&m.path).envs(self.env(&m));
+        // A log needs the output, so the command writes to pipes that are
+        // copied to agent-ws's own stdout and stderr and to the log. That
+        // takes the terminal away from it: interactive agents run without.
+        let log_file = if log {
+            std::fs::create_dir_all(self.dir.join("runs"))?;
+            cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+            Some(Arc::new(Mutex::new(std::fs::File::create(
+                self.log_path(name),
+            )?)))
+        } else {
+            None
+        };
+        let mut child = cmd.spawn().with_context(|| format!("run {prog}"))?;
+        let mut copies = Vec::new();
+        if let Some(file) = &log_file {
+            if let Some(out) = child.stdout.take() {
+                copies.push(tee(out, std::io::stdout(), file.clone()));
+            }
+            if let Some(err) = child.stderr.take() {
+                copies.push(tee(err, std::io::stderr(), file.clone()));
+            }
+        }
         let restore = ignore_interrupts();
         let mut run = Run {
             command: command.to_vec(),
@@ -2182,9 +2337,13 @@ impl Repo {
             started: now(),
             ended: None,
             exit_code: None,
+            log,
         };
         self.write_run(name, &run);
         let status = child.wait();
+        for c in copies {
+            let _ = c.join();
+        }
         restore();
         let status = status?;
         let code = status
@@ -2199,17 +2358,26 @@ impl Repo {
     /// `list` plus what a coordinator wants to know about each workspace:
     /// age, port, uncommitted changes, commits, processes inside, the last
     /// `exec`, and real disk use.
-    pub fn list_long(&self) -> Result<Vec<WsInfo>> {
+    /// `disk` adds the real disk use, which walks every file: a dashboard
+    /// polling every few seconds asks for it less often.
+    pub fn list_long(&self, disk: bool) -> Result<Vec<WsInfo>> {
         let metas = self.list()?;
         let users = fsutil::cwd_users(
             &std::fs::canonicalize(self.dir.join("ws")).unwrap_or(self.dir.join("ws")),
         );
-        let sizes = usage_parallel(metas.iter().map(|m| m.path.clone()).collect());
+        let sizes: Vec<Option<u64>> = if disk {
+            usage_parallel(metas.iter().map(|m| m.path.clone()).collect())
+                .into_iter()
+                .map(|u| Some(u.private))
+                .collect()
+        } else {
+            vec![None; metas.len()]
+        };
         let now = now();
         Ok(metas
             .into_iter()
             .zip(sizes)
-            .map(|(m, usage)| {
+            .map(|(m, private_bytes)| {
                 let real = std::fs::canonicalize(&m.path).unwrap_or(m.path.clone());
                 let dirty = git::run(&m.path, &["--no-optional-locks", "status", "--porcelain"])
                     .ok()
@@ -2225,28 +2393,41 @@ impl Repo {
                     .filter(|(_, cwd)| cwd.starts_with(&real))
                     .map(|(pid, _)| *pid)
                     .collect();
-                let run = self.read_run(&m.name).map(|run| RunInfo {
-                    state: match run.ended {
-                        Some(_) => "exited",
-                        None if pid_alive(run.pid, run.pid_start) => "running",
-                        None => "interrupted",
-                    }
-                    .into(),
-                    run,
-                });
                 WsInfo {
                     age_secs: now.saturating_sub(m.created),
                     port: self.port(&m),
                     dirty,
                     ahead,
                     processes,
-                    run,
-                    private_bytes: usage.private,
+                    run: self.run_info(&m.name),
+                    private_bytes,
                     meta: m,
                 }
             })
             .collect())
     }
+}
+
+/// Copy `from` to `to` and to `log` as it arrives, until `from` closes.
+fn tee(
+    mut from: impl std::io::Read + Send + 'static,
+    mut to: impl std::io::Write + Send + 'static,
+    log: std::sync::Arc<std::sync::Mutex<std::fs::File>>,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        use std::io::Write;
+        let mut buf = [0u8; 8192];
+        while let Ok(n) = from.read(&mut buf) {
+            if n == 0 {
+                break;
+            }
+            let _ = to.write_all(&buf[..n]);
+            let _ = to.flush();
+            if let Ok(mut f) = log.lock() {
+                let _ = f.write_all(&buf[..n]);
+            }
+        }
+    })
 }
 
 /// Ignore Ctrl-C and Ctrl-\ in this process until the returned closure runs,
