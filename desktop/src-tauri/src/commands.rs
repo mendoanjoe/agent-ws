@@ -153,7 +153,7 @@ fn open_with(target: &str, how: &str) -> anyhow::Result<()> {
     // The first of these on PATH; the desktop's default handler otherwise.
     // A terminal starts in the folder; an editor gets it as an argument.
     let mut cmd = match how {
-        "editor" => match ["cursor", "code", "zed"].iter().find(on_path) {
+        "editor" => match ["cursor", "code", "zed"].into_iter().find(on_path) {
             Some(editor) => {
                 let mut c = Command::new(editor);
                 c.arg(target);
@@ -162,7 +162,7 @@ fn open_with(target: &str, how: &str) -> anyhow::Result<()> {
             None => default_handler(target),
         },
         "terminal" => match ["x-terminal-emulator", "gnome-terminal", "konsole", "xterm"]
-            .iter()
+            .into_iter()
             .find(on_path)
         {
             Some(terminal) => {
