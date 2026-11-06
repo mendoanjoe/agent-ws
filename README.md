@@ -202,8 +202,9 @@ process (an agent, a shell) has as its current directory. The base is
 
 If you forget: every `spawn` also starts a background prune, at most once
 per 10 minutes. It drops merged workspaces only and leaves never-used ones,
-since a coordinator may have spawned those for later. Turn it off with
-`auto_prune = false`.
+since a coordinator may have spawned those for later. The exception is
+Claude Code's worktrees, which Claude never removes for subagents: unused
+ones go once they are a day old. Turn it off with `auto_prune = false`.
 
 `spawn` warns from 20 workspaces and below 10 GB free disk. See
 [docs/disk-usage.md](docs/disk-usage.md) for measurements.
@@ -217,8 +218,9 @@ registers the folder again, so you can `land` or `drop` it.
 `agent-ws pool set N` keeps N workspaces ready, so `spawn` takes ~40 ms and
 refills the pool in the background. A pooled workspace is only handed out
 while it still matches your repository: same `HEAD`, same settings, same
-lockfiles. Spawns with `--base`, `--exclude`, `--keep-secrets` or `--no-pool`
-always clone fresh. `pool set 0` turns it off; the maximum is 8.
+lockfiles. Spawns with `--exclude`, `--keep-secrets`, `--carry` or
+`--no-pool`, or a `--base` other than `HEAD`, always clone fresh. `pool set 0`
+turns it off; the maximum is 8.
 
 ## Configuration
 

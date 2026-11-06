@@ -10,7 +10,9 @@ The measurements are read-only, on what was left of
 `du` counts every allocated block of every file, so a cloned block counts
 once per clone. APFS knows how much of a file no other file shares
 (`getattrlist` with `ATTR_CMNEXT_PRIVATESIZE`); deleting the file frees at
-least that much. `agent-ws du` adds that up per workspace.
+least that much. `agent-ws du` adds that up per workspace. On Linux it reads
+the same from the extents `FIEMAP` does not flag as shared (Btrfs, XFS); the
+measurements below are from a Mac.
 
 | | `du -A` (logical) | `du` (allocated) | private (real) |
 | --- | --- | --- | --- |

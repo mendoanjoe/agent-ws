@@ -196,8 +196,9 @@ do not pile up.
 
 ## Notes
 
-- `land` creates a **local** branch `agent-ws/NAME` only. Pushing and opening a
-  PR follow your repo's usual rules.
+- `land` creates a **local** branch `agent-ws/NAME`. With `--pr` it also pushes
+  it to `origin` and opens a pull request with the GitHub CLI (`gh`);
+  otherwise pushing follows your repo's usual rules.
 - Every agent-ws command takes `--json` if you need to parse it in a script.
 - Command flags above were verified against each CLI's `--help`. Agents change;
   if a flag differs, `agent -h` is the source of truth — the agent-ws side
