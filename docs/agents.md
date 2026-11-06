@@ -20,7 +20,10 @@ forms:
   fleets.
 
 Where an agent has a native working-directory flag we use it; otherwise we use the
-universal `(cd "$W" && agent ...)` subshell, which works for every agent.
+universal `(cd "$W" && agent ...)` subshell, which works for every agent. The
+shortest universal form is `agent-ws exec NAME -- agent ...`: it starts the agent
+inside the workspace with `PORT` and `AGENT_WS_*` set, and `--spawn` creates the
+workspace first.
 
 > Paste this line into the prompt you give *any* agent:
 >
@@ -51,6 +54,12 @@ agent-ws land fix-login -m "fix: login redirect"
 
 `--add-dir DIR` can grant the agent access to a second directory if a task needs
 it; by default the workspace alone is writable.
+
+Claude Code can also create the workspaces itself: after `agent-ws claude
+install`, every worktree Claude Code makes (`claude --worktree`, subagents with
+`isolation: "worktree"`, workflows, background sessions) is an agent-ws
+workspace on a branch `agent-ws/<name>`, dependencies included. See the
+[README](../README.md#claude-code).
 
 ## Codex (`codex`)
 
@@ -148,18 +157,21 @@ until you `land`.
 agent-ws pool set 4
 
 for t in auth ui perf docs; do
-  agent-ws spawn "$t" >/dev/null
-  W=$(agent-ws path "$t")
-  (cd "$W" && my-agent -p "Task $t: ...") &
+  agent-ws exec "$t" --spawn -- my-agent -p "Task $t: ..." &
 done
 wait
 
-agent-ws status                 # OVERLAP lines = two agents touched one file
+agent-ws list --long            # exit code of each agent, changes, disk use
+agent-ws status                 # OVERLAP: two agents touched one file
+                                # CONFLICT: their changes do not merge
+agent-ws diff auth              # review one before landing it
 for t in auth ui perf docs; do agent-ws land "$t" -m "agent: $t"; done
 ```
 
-Read the `OVERLAP` lines before landing: if two workspaces changed the same file,
-land them in order (or merge by hand) rather than force-overwriting a branch.
+`exec` starts the agent inside the workspace and gives each one its own `PORT`
+(4100, 4110, …), so agents that start dev servers do not collide. Read the
+`CONFLICT` lines before landing: those pairs need an order, or a merge by
+hand; an `OVERLAP` without a `CONFLICT` merges cleanly.
 
 ## After a crash
 

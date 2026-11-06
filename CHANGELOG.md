@@ -6,6 +6,41 @@ All notable changes to agent-ws are listed here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- **Claude Code worktrees.** `agent-ws claude install` (`--scope
+  local|project|user`) registers agent-ws as Claude Code's `WorktreeCreate`
+  and `WorktreeRemove` hook. `claude --worktree`, subagents with `isolation:
+  "worktree"`, workflows and background sessions then get a workspace with
+  dependencies, from the pool when one is ready, on a branch
+  `agent-ws/<name>` that keeps the session's commits. Unused Claude worktrees,
+  which Claude Code never removes for subagents, are pruned after a day.
+  `agent-ws claude uninstall` undoes it.
+- **Linux**, on Btrfs and XFS: files are reflinked (`FICLONE`), `du` reads
+  shared extents with `FIEMAP`, and processes come from `/proc`. Releases
+  include static x86_64 and arm64 Linux binaries.
+- `agent-ws exec NAME [--spawn] -- CMD` runs a command in a workspace with
+  `PORT` (4100, 4110, … one range per workspace, `port_base`/`port_step`) and
+  `AGENT_WS_NAME`, `AGENT_WS_PATH`, `AGENT_WS_BASE`, `AGENT_WS_REPO`,
+  `AGENT_WS_SLOT`, and exits with the command's exit code.
+- `agent-ws diff NAME [--stat] [PATH…]`: the full patch since the base, new
+  files included, without touching the workspace's index; `--json` lists
+  files with line counts.
+- `status` merges overlapping workspaces in memory (Git 2.38+) and lists the
+  pairs that would conflict as `CONFLICT`, with their paths.
+- `agent-ws list --long`: age, port, uncommitted changes, commits, processes
+  inside, the last `exec` (running, exit code, interrupted) and real disk use.
+- `[hooks]` in `.agent-ws.toml`: `post_spawn` runs in each new workspace,
+  `pre_land` before `land` commits. They run only after `agent-ws trust`, and
+  again only after another `trust` once they change.
+- `spawn --carry` brings your uncommitted edits and untracked files along;
+  `spawn --branch B` checks out a new branch in the workspace.
+- `land --squash` makes one commit; `land --pr` pushes the branch and opens a
+  pull request with the GitHub CLI (`--pr-base`, `--draft`). If the push
+  fails, the workspace stays and the same command resumes.
+- `agent-ws completions bash|zsh|fish|elvish|powershell`; the Homebrew formula
+  installs them.
+
 ## [0.2.2] - 2026-11-06
 
 ### Fixed

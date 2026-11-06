@@ -5,7 +5,8 @@ welcome. This page explains how to work on the code.
 
 ## Setup
 
-You need macOS on APFS, Git 2.31+ and Rust 1.88+ with `rustfmt` and `clippy`:
+You need macOS on APFS, or Linux with a Btrfs or XFS volume, Git 2.38+ and
+Rust 1.88+ with `rustfmt` and `clippy`:
 
 ```sh
 rustup component add rustfmt clippy
@@ -14,6 +15,11 @@ cd agent-ws
 cargo build
 cargo test
 ```
+
+On Linux the tests need reflinks where they create their throwaway
+repositories: point `TMPDIR` at a Btrfs or XFS folder (`TMPDIR=/mnt/xfs cargo
+test`). CI does the same on loop-mounted XFS and Btrfs images; see
+`.github/workflows/ci.yml`.
 
 Read [docs/how-it-works.md](docs/how-it-works.md) first; it explains the
 records, the pool and the safety rules the code relies on.
@@ -80,16 +86,16 @@ very good reason in the PR description.
 2. Set `version` in `Cargo.toml`, run `cargo build`, and commit as
    `chore: release vX.Y.Z`.
 3. `git tag -a vX.Y.Z -m "agent-ws vX.Y.Z" && git push origin master vX.Y.Z`.
-   The Release workflow builds the macOS binaries and creates the GitHub
-   release from the changelog section.
+   The Release workflow builds the macOS and Linux binaries and creates the
+   GitHub release from the changelog section.
 4. `cargo publish`.
 5. In `mendoanjoe/homebrew-tap`, update `Formula/agent-ws.rb` with the new
-   version and the sha256 values from the release's `.sha256` files.
+   version and the sha256 values of the two macOS archives from the
+   release's `.sha256` files.
 
 ## Ideas that need help
 
-- Linux support with reflinks (Btrfs, XFS) and a fallback where they are
-  missing.
+- A faster Linux clone: reflinking files in parallel.
 - Smarter pool freshness for ignored files beyond the stamp files.
 
 ## Reporting bugs

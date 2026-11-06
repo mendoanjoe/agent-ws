@@ -1,15 +1,17 @@
 # agent-ws
 
-Instant, isolated workspaces for coding agents on macOS.
+Instant, isolated workspaces for coding agents on macOS and Linux.
 
 Running several coding agents on one repository means one checkout per agent.
 `git worktree add` gives you that, but every worktree needs its own dependency
 install, takes seconds to create and remove, and costs a full copy on disk.
 
-agent-ws clones your checkout with APFS copy-on-write instead: dependencies and
-build caches come along, nothing is copied until it is written, and a workspace
-is ready in about a second, or in ~40 ms from a pool. When the agent is done,
-`land` turns its work into a branch.
+agent-ws clones your checkout copy-on-write instead (APFS clones on macOS,
+reflinks on Btrfs and XFS on Linux): dependencies and build caches come along,
+nothing is copied until it is written, and a workspace is ready in about a
+second, or in ~40 ms from a pool. When the agent is done, `land` turns its work
+into a branch or a pull request. It can also be the worktree backend of Claude
+Code, so `claude --worktree` and subagents start with dependencies installed.
 
 | | `git worktree` + install | agent-ws |
 | --- | --- | --- |
@@ -22,20 +24,25 @@ see [Benchmarks](#benchmarks).
 
 ## Requirements
 
-- macOS with an APFS volume (the default on every modern Mac)
-- Git 2.31 or later
+- macOS with an APFS volume (the default on every modern Mac), or Linux with
+  the repository on Btrfs or XFS (`reflink=1`, the default since xfsprogs
+  5.1). ext4 has no reflinks.
+- Git 2.31 or later (2.38 or later for conflict detection in `status`)
 - Rust 1.88 or later, to build
 
 ## Install
 
 ```sh
-brew install mendoanjoe/tap/agent-ws   # prebuilt binary
-cargo binstall agent-ws                # prebuilt binary, via cargo-binstall
+brew install mendoanjoe/tap/agent-ws   # macOS, prebuilt, with shell completion
+cargo binstall agent-ws                # macOS and Linux, prebuilt
 cargo install agent-ws                 # build from source (Rust 1.88+)
 ```
 
-Prebuilt binaries for Apple silicon and Intel are also attached to each
-[GitHub release](https://github.com/mendoanjoe/agent-ws/releases).
+Prebuilt binaries for Apple silicon, Intel Macs and Linux (x86_64 and arm64,
+static) are also attached to each
+[GitHub release](https://github.com/mendoanjoe/agent-ws/releases). Shell
+completion for other installs: `agent-ws completions zsh > ~/.zfunc/_agent-ws`
+(or `bash`, `fish`).
 For the latest unreleased version: `cargo install --git https://github.com/mendoanjoe/agent-ws`,
 or from a clone: `cargo install --path .`
 
@@ -48,15 +55,18 @@ agent-ws spawn fix-login             # create a workspace (base: HEAD)
 cd "$(agent-ws path fix-login)"      # it is a normal Git worktree; deps included
 # ... edit, build, test, commit if you like ...
 agent-ws status                      # what each workspace changed
+agent-ws diff fix-login              # the full patch, new files included
 agent-ws land fix-login -m "fix: login redirect"   # -> branch agent-ws/fix-login
 ```
 
 `land` commits whatever is left, creates the local branch `agent-ws/<name>` in
-your repository and removes the workspace. Push it or open a PR as usual. To
+your repository and removes the workspace. Add `--pr` to push it and open a
+pull request (with the GitHub CLI), or `--squash` for a single commit. To
 throw the work away instead: `agent-ws drop fix-login`.
 
 Your own checkout is never changed: its uncommitted edits are not copied into
-workspaces, and nothing written in a workspace reaches it.
+workspaces (unless you hand them over with `spawn --carry`), and nothing
+written in a workspace reaches it.
 
 ## Using it with coding agents
 
@@ -65,29 +75,56 @@ coordinator (you, a script, or an orchestrating agent) creates the workspace
 first and starts the agent inside it:
 
 ```sh
-agent-ws spawn task-42
-W=$(agent-ws path task-42)
-(cd "$W" && claude)                  # or codex, opencode, omp, aider, ...
+agent-ws exec task-42 --spawn -- claude   # or codex, opencode, omp, aider, ...
 agent-ws land task-42 -m "feat: task 42"
 ```
 
-Each agent starts a little differently (`codex -C`, `omp --cwd`, the `cd`
-subshell for `claude` and `cursor-agent`, …). [docs/agents.md](docs/agents.md)
-has a verified, copy-paste recipe for Claude Code, Codex, opencode, omp, Cursor
-Agent and aider — interactive and headless — plus a parallel-fleet script.
+`exec` runs any command inside the workspace (`--spawn` creates it first) and
+passes on its exit code. Each workspace has its own port: commands get
+`PORT=4100` in the first workspace, `4110` in the next, and so on, plus
+`AGENT_WS_NAME`, `AGENT_WS_PATH` and friends, so the dev servers of parallel
+agents do not collide. `agent-ws list --long` shows each workspace's age,
+port, changes, the processes inside and whether its last `exec` is still
+running.
+
+Each agent starts a little differently (`codex -C`, `omp --cwd`, …).
+[docs/agents.md](docs/agents.md) has a verified, copy-paste recipe for Claude
+Code, Codex, opencode, omp, Cursor Agent and aider — interactive and
+headless — plus a parallel-fleet script.
 
 Several agents in parallel:
 
 ```sh
 agent-ws pool set 4                  # keep 4 workspaces ready
 for t in a b c d; do
-  agent-ws spawn "$t"
-  (cd "$(agent-ws path "$t")" && my-agent --task "$t") &
+  agent-ws exec "$t" --spawn -- my-agent --task "$t" &
 done
 wait
-agent-ws status                      # OVERLAP lines: two agents touched one file
+agent-ws status                      # OVERLAP: two agents touched one file;
+                                     # CONFLICT: their changes do not merge
 for t in a b c d; do agent-ws land "$t" -m "agent: $t"; done
 ```
+
+### Claude Code
+
+Claude Code makes its own git worktrees for `claude --worktree`, for subagents
+with `isolation: "worktree"`, for workflows and for background sessions,
+without your dependencies. Let agent-ws make them instead:
+
+```sh
+agent-ws claude install              # this repository, only you
+agent-ws claude install --scope user # every repository
+```
+
+This adds `agent-ws claude hook` as Claude Code's `WorktreeCreate` and
+`WorktreeRemove` hook (in `.claude/settings.local.json`, or
+`~/.claude/settings.json` for `--scope user`; `--scope project` writes the
+shared `.claude/settings.json`). Each Claude worktree is then a workspace on a
+branch `agent-ws/<name>`, from the pool when one is ready. Its commits stay on
+that branch when Claude removes the worktree. Claude Code never removes the
+worktrees of subagents; the background prune drops unused ones after a day.
+`agent-ws claude uninstall` undoes it. `agent-ws` must be on Claude Code's
+`PATH`.
 
 A line worth putting in every agent prompt:
 
@@ -100,20 +137,27 @@ Every command accepts `--json` for scripts.
 
 | Command | What it does |
 | --- | --- |
-| `spawn NAME` | Create a workspace. `--base REV`, `--exclude PATH`, `--keep-secrets`, `--no-pool`, `--min-free-gb N` |
+| `spawn NAME` | Create a workspace. `--base REV`, `--exclude PATH`, `--keep-secrets`, `--no-pool`, `--min-free-gb N`, `--carry` (bring your uncommitted edits), `--branch B` (check out a new branch), `--no-hooks` |
+| `exec NAME -- CMD` | Run a command in the workspace with `PORT` and `AGENT_WS_*` set; exits with its code. `--spawn`, `--base REV` |
 | `path NAME` | Print the workspace folder |
-| `list` | List workspaces |
-| `status [NAME]` | Changed files per workspace and files changed in more than one (`OVERLAP`) |
-| `land NAME -m MSG` | Commit, create branch `agent-ws/NAME`, remove the workspace. `--branch B`, `--keep`, `--no-verify`, `--force-branch` |
+| `list` | List workspaces. `--long`: age, port, changes, processes inside, last `exec`, real disk use |
+| `status [NAME]` | Changed files per workspace, files changed in more than one (`OVERLAP`), and pairs whose changes conflict (`CONFLICT`) |
+| `diff NAME [PATH…]` | What the workspace changed since its base, new files included. `--stat`; `--json` gives files with line counts |
+| `land NAME -m MSG` | Commit, create branch `agent-ws/NAME`, remove the workspace. `--branch B`, `--keep`, `--no-verify`, `--force-branch`, `--squash`, `--pr` (`--pr-base B`, `--draft`) |
 | `drop NAME` | Remove a workspace without landing |
 | `prune` | Drop workspaces whose work is already merged. `--dry-run`, `--base BRANCH`, `--gh`, `--min-age-min N` |
 | `du [NAME]` | Real disk use per workspace (bytes no other file shares) next to what `du` shows |
 | `pool set N` / `fill` / `status` / `clear` | Keep N workspaces ready (at most 8) |
 | `gc [--dry-run]` | Clean up after crashed or killed processes |
+| `trust` | Allow the hooks in `.agent-ws.toml` to run (again after they change) |
+| `claude install` / `uninstall` | Make Claude Code create its worktrees with agent-ws. `--scope local\|project\|user` |
+| `completions SHELL` | Print a completion script for bash, zsh, fish, elvish or powershell |
 
 ## What a workspace contains
 
 - Your tracked files at the base commit.
+- With `--carry`: your uncommitted edits and untracked files too, as
+  uncommitted changes on `HEAD`.
 - Your ignored files: `node_modules`, build caches, generated files.
 - Your submodules, each with its own copy of its Git data.
 - Not: your uncommitted edits, untracked files, or untracked secret files
@@ -191,11 +235,33 @@ pool_stamp = ["pnpm-lock.yaml"] # files whose change makes pooled workspaces sta
 prune_base = "origin/develop"   # branch `prune` compares against
 warn_workspaces = 30            # spawn warns from this many workspaces (0 = never)
 auto_prune = false              # no background prune after spawn (default on)
+port_base = 5000                # PORT of the first workspace (default 4100)
+port_step = 20                  # ports per workspace (default 10)
+
+[hooks]
+post_spawn = ["op inject -i .env.tpl -o .env"] # run in each new workspace
+pre_land = ["pnpm test"]                       # must pass before `land` commits
 ```
 
 Unknown keys are an error. Workspaces and state live in
-`~/.agent-ws/<repo>-<hash>/`; set `AGENT_WS_HOME` to move them (same APFS
-volume as the repository).
+`~/.agent-ws/<repo>-<hash>/`; set `AGENT_WS_HOME` to move them (same volume as
+the repository).
+
+### Hooks
+
+Hooks are shell commands run inside the workspace, with the same environment
+as `exec` (`PORT`, `AGENT_WS_NAME`, …). `post_spawn` runs after every spawn,
+also from the pool; if it fails, the workspace is removed again. `pre_land`
+runs before `land` commits; if it fails, nothing is committed. Their output
+goes to stderr.
+
+Because `.agent-ws.toml` comes with the repository, hooks run only after you
+have read them and run `agent-ws trust`; after any change to them, `spawn` and
+`land` stop and list them until you trust them again. Skip them once with
+`spawn --no-hooks` or `land --no-verify`.
+
+A typical use: secret files never reach workspaces, so pull development
+secrets from your secret manager in `post_spawn` instead of copying yours.
 
 ## Troubleshooting
 
@@ -209,6 +275,10 @@ volume as the repository).
 | First build in a workspace is slow | Expected: files are read cold once; later builds are warm. |
 | `du` shows huge numbers for `~/.agent-ws` | Shared clone blocks are counted once per workspace. `agent-ws du` shows the real use; `agent-ws prune` frees merged ones. |
 | `WARNING N workspaces exist` | `agent-ws prune --dry-run`, then `agent-ws prune`; drop the rest you no longer need. |
+| `.agent-ws.toml has hooks that run commands …` | Read the listed commands, then `agent-ws trust`; or `--no-hooks` / `--no-verify` once. |
+| `reflink …: Operation not supported` (Linux) | The repository is on a filesystem without reflinks (ext4). Use Btrfs or XFS for the repository and `AGENT_WS_HOME`. |
+| `(conflict check needs Git 2.38 or later)` | `status` still lists overlaps; update Git to see which ones conflict. |
+| Claude Code: `WorktreeCreate hook failed` | `agent-ws` must be on Claude Code's `PATH`. The hook's error is in Claude Code's debug log. |
 
 ## Benchmarks
 
@@ -240,9 +310,9 @@ bench/bench.sh /tmp/my-repo-copy "pnpm install --frozen-lockfile --offline"
 
 ## Contributing
 
-Contributions are welcome: bug reports, fixes, Linux support (reflink),
-docs. See [CONTRIBUTING.md](CONTRIBUTING.md) for setup, tests and the review
-checklist.
+Contributions are welcome: bug reports, fixes, more agents in
+[docs/agents.md](docs/agents.md), docs. See [CONTRIBUTING.md](CONTRIBUTING.md)
+for setup, tests and the review checklist.
 
 ## License
 
