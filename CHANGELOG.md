@@ -6,6 +6,36 @@ All notable changes to agent-ws are listed here. The format follows
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-11-06
+
+### Fixed
+
+- `spawn` no longer deletes files that hold only certificates. They match
+  `*.pem` by name, but they are public: without certifi's `cacert.pem` CA
+  bundle, pip and requests in a workspace's Python `.venv` failed every
+  HTTPS call. A file is still removed if it holds a private key, or if it is
+  not a PEM file at all.
+- `agent-ws status` no longer rewrites the workspace index. A coordinator
+  polling `status` while an agent committed could make the agent's commit
+  fail with `index.lock: File exists`.
+- `spawn` refuses workspace names that cannot become the branch
+  `agent-ws/NAME` (`fix.lock`, `a..b`, `v2.`). `land` checks the branch
+  name, including `--branch`, before committing anything. Before, it
+  committed first and then failed, and landing again left two commits.
+- `prune --gh` now asks GitHub about every local branch at the workspace's
+  HEAD. A workspace kept with `land --keep` runs on a detached HEAD, so it
+  was never matched with its merged `agent-ws/NAME` PR.
+- `land` no longer fails when another workspace cannot be read by Git; that
+  workspace is left out of the overlap check. `status` names the workspace
+  in its error.
+- The published crate holds only the source, tests, README, license and
+  changelog.
+
+### Changed
+
+- CI and release workflows use the Node 24 versions of the GitHub actions
+  (`checkout` v7, `upload-artifact` v7, `download-artifact` v8).
+
 ## [0.2.1] - 2026-10-26
 
 ### Added
@@ -57,7 +87,8 @@ All notable changes to agent-ws are listed here. The format follows
 First release: `spawn`, `list`, `status`, `path`, `land`, `drop`, `gc`, the
 pool of ready workspaces and the config file.
 
-[Unreleased]: https://github.com/mendoanjoe/agent-ws/compare/v0.2.1...HEAD
+[Unreleased]: https://github.com/mendoanjoe/agent-ws/compare/v0.2.2...HEAD
+[0.2.2]: https://github.com/mendoanjoe/agent-ws/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/mendoanjoe/agent-ws/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/mendoanjoe/agent-ws/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/mendoanjoe/agent-ws/releases/tag/v0.1.0

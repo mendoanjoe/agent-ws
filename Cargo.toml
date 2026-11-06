@@ -1,6 +1,6 @@
 [package]
 name = "agent-ws"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2024"
 rust-version = "1.88"
 description = "Instant, isolated workspaces for coding agents on macOS (APFS clone-on-write)"
@@ -9,6 +9,7 @@ repository = "https://github.com/mendoanjoe/agent-ws"
 readme = "README.md"
 keywords = ["git", "worktree", "agent", "apfs", "workspace"]
 categories = ["command-line-utilities", "development-tools", "filesystem"]
+include = ["/src", "/tests", "/README.md", "/LICENSE", "/CHANGELOG.md"]
 
 [package.metadata.docs.rs]
 targets = ["aarch64-apple-darwin", "x86_64-apple-darwin"]
