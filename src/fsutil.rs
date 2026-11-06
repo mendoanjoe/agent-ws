@@ -1,12 +1,15 @@
-//! Filesystem helpers: APFS clonefile, free space, symlink repair.
+//! Filesystem helpers: copy-on-write clones (APFS clonefile on macOS,
+//! reflinks on Linux Btrfs/XFS), disk use, free space, symlink repair.
 
 use anyhow::{Context, Result, bail};
 use std::ffi::CString;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
+#[cfg(target_os = "macos")]
 const CLONE_NOFOLLOW: u32 = 0x0001;
 
+#[cfg(target_os = "macos")]
 unsafe extern "C" {
     fn clonefile(src: *const libc::c_char, dst: *const libc::c_char, flags: u32) -> libc::c_int;
 }
@@ -17,12 +20,79 @@ fn cstr(p: &Path) -> Result<CString> {
 
 /// Clone a file, symlink or whole directory in one syscall. Data blocks are
 /// shared copy-on-write, so this costs metadata only.
+#[cfg(target_os = "macos")]
 pub fn clone_path(src: &Path, dst: &Path) -> Result<()> {
     let (s, d) = (cstr(src)?, cstr(dst)?);
     if unsafe { clonefile(s.as_ptr(), d.as_ptr(), CLONE_NOFOLLOW) } != 0 {
         let err = std::io::Error::last_os_error();
         bail!("clonefile {} -> {}: {err}", src.display(), dst.display());
     }
+    Ok(())
+}
+
+/// Clone a file, symlink or whole directory. Linux has no directory clone,
+/// so directories are recreated and every file is reflinked (`FICLONE`):
+/// data blocks are shared copy-on-write, as with APFS clones. Modes and
+/// timestamps are kept, so build tools see the files as unchanged. Sockets,
+/// pipes and devices are skipped. Fails on a filesystem without reflinks
+/// (ext4): only Btrfs and XFS (with reflink=1, the default) have them.
+#[cfg(target_os = "linux")]
+pub fn clone_path(src: &Path, dst: &Path) -> Result<()> {
+    let md = std::fs::symlink_metadata(src).with_context(|| format!("stat {}", src.display()))?;
+    let ft = md.file_type();
+    if ft.is_symlink() {
+        std::os::unix::fs::symlink(std::fs::read_link(src)?, dst)
+            .with_context(|| format!("symlink {}", dst.display()))?;
+    } else if ft.is_dir() {
+        std::fs::create_dir(dst).with_context(|| format!("mkdir {}", dst.display()))?;
+        for entry in std::fs::read_dir(src)? {
+            let entry = entry?;
+            clone_path(&entry.path(), &dst.join(entry.file_name()))?;
+        }
+        // After the children: a read-only folder could not take them, and
+        // creating them changed its mtime.
+        std::fs::set_permissions(dst, md.permissions())?;
+        let _ = keep_times(dst, &md);
+    } else if ft.is_file() {
+        reflink(src, dst, &md)?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn reflink(src: &Path, dst: &Path, md: &std::fs::Metadata) -> Result<()> {
+    use std::os::fd::AsRawFd;
+    let from = std::fs::File::open(src).with_context(|| format!("open {}", src.display()))?;
+    let to = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(dst)
+        .with_context(|| format!("create {}", dst.display()))?;
+    if unsafe { libc::ioctl(to.as_raw_fd(), libc::FICLONE as _, from.as_raw_fd()) } != 0 {
+        let err = std::io::Error::last_os_error();
+        drop(to);
+        let _ = std::fs::remove_file(dst);
+        bail!(
+            "reflink {} -> {}: {err}; agent-ws needs a filesystem with reflinks (Btrfs, or XFS with reflink=1)",
+            src.display(),
+            dst.display()
+        );
+    }
+    to.set_permissions(md.permissions())?;
+    to.set_times(times(md)?)?;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn times(md: &std::fs::Metadata) -> Result<std::fs::FileTimes> {
+    Ok(std::fs::FileTimes::new()
+        .set_accessed(md.accessed()?)
+        .set_modified(md.modified()?))
+}
+
+#[cfg(target_os = "linux")]
+fn keep_times(dir: &Path, md: &std::fs::Metadata) -> Result<()> {
+    std::fs::File::open(dir)?.set_times(times(md)?)?;
     Ok(())
 }
 
@@ -200,11 +270,13 @@ pub fn scan(
 }
 
 /// `ATTR_CMNEXT_PRIVATESIZE` from `<sys/attr.h>` (not in the libc crate).
+#[cfg(target_os = "macos")]
 const ATTR_CMNEXT_PRIVATESIZE: u32 = 0x0000_0008;
 
 /// Bytes of a file's data that no other file shares, as APFS counts them.
 /// A fresh clone has 0; a file written after cloning, or whose clone
 /// siblings were all deleted, owns its blocks. `None` if APFS cannot say.
+#[cfg(target_os = "macos")]
 pub fn private_size(path: &Path) -> Option<u64> {
     let c = cstr(path).ok()?;
     let mut al: libc::attrlist = unsafe { std::mem::zeroed() };
@@ -225,6 +297,68 @@ pub fn private_size(path: &Path) -> Option<u64> {
         return None;
     }
     Some(i64::from_ne_bytes(buf[4..12].try_into().ok()?).max(0) as u64)
+}
+
+/// Bytes of a file's data that no other file shares: the extents `FIEMAP`
+/// does not flag as shared (Btrfs and XFS flag reflinked ones). `None` if
+/// the filesystem cannot say.
+#[cfg(target_os = "linux")]
+pub fn private_size(path: &Path) -> Option<u64> {
+    use std::os::fd::AsRawFd;
+    /// `struct fiemap_extent` from `<linux/fiemap.h>`.
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct Extent {
+        logical: u64,
+        physical: u64,
+        length: u64,
+        reserved64: [u64; 2],
+        flags: u32,
+        reserved: [u32; 3],
+    }
+    /// `struct fiemap` with room for a batch of extents.
+    #[repr(C)]
+    struct Fiemap {
+        start: u64,
+        length: u64,
+        flags: u32,
+        mapped: u32,
+        count: u32,
+        reserved: u32,
+        extents: [Extent; 64],
+    }
+    // _IOWR('f', 11, struct fiemap), the header being 32 bytes.
+    const FS_IOC_FIEMAP: libc::c_ulong = 0xC020_660B;
+    // Flush first, so data not yet written out has extents to count.
+    const FIEMAP_FLAG_SYNC: u32 = 0x1;
+    const FIEMAP_EXTENT_LAST: u32 = 0x1;
+    const FIEMAP_EXTENT_SHARED: u32 = 0x2000;
+
+    let file = std::fs::File::open(path).ok()?;
+    let mut private = 0;
+    let mut start = 0;
+    loop {
+        let mut map: Fiemap = unsafe { std::mem::zeroed() };
+        map.start = start;
+        map.length = u64::MAX - start;
+        map.flags = FIEMAP_FLAG_SYNC;
+        map.count = 64;
+        if unsafe { libc::ioctl(file.as_raw_fd(), FS_IOC_FIEMAP as _, &raw mut map) } != 0 {
+            return None;
+        }
+        if map.mapped == 0 {
+            return Some(private);
+        }
+        for e in &map.extents[..(map.mapped as usize).min(64)] {
+            if e.flags & FIEMAP_EXTENT_SHARED == 0 {
+                private += e.length;
+            }
+            if e.flags & FIEMAP_EXTENT_LAST != 0 {
+                return Some(private);
+            }
+            start = e.logical + e.length;
+        }
+    }
 }
 
 /// Disk use of a tree, counting regular files only.
@@ -295,6 +429,25 @@ pub fn usage_by(root: &Path, depth: usize) -> (Usage, Vec<(PathBuf, Usage)>) {
 
 /// Processes of this user whose current directory is inside `root`
 /// (canonical path), as (pid, cwd). Agents and shells sit in their workspace.
+#[cfg(target_os = "linux")]
+pub fn cwd_users(root: &Path) -> Vec<(u32, PathBuf)> {
+    // Other users' `/proc/<pid>/cwd` cannot be read; their processes do
+    // not sit in this user's workspaces.
+    std::fs::read_dir("/proc")
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| {
+            let pid = e.file_name().to_str()?.parse::<u32>().ok()?;
+            let cwd = std::fs::read_link(e.path().join("cwd")).ok()?;
+            cwd.starts_with(root).then_some((pid, cwd))
+        })
+        .collect()
+}
+
+/// Processes of this user whose current directory is inside `root`
+/// (canonical path), as (pid, cwd). Agents and shells sit in their workspace.
+#[cfg(target_os = "macos")]
 pub fn cwd_users(root: &Path) -> Vec<(u32, PathBuf)> {
     let mut pids = vec![0 as libc::c_int; 8192];
     let n = unsafe {

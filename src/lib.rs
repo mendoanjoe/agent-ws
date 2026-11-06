@@ -1,13 +1,16 @@
 //! agent-ws: instant, isolated workspaces for coding agents.
 //!
-//! A workspace is a Git worktree whose files are APFS clones of the source
-//! checkout, ignored files included (`node_modules`, build caches). Spawning
-//! costs metadata only, so agents skip `install` and start with warm caches.
+//! A workspace is a Git worktree whose files are copy-on-write clones of the
+//! source checkout (APFS clones on macOS, reflinks on Linux Btrfs/XFS),
+//! ignored files included (`node_modules`, build caches). Spawning costs
+//! metadata only, so agents skip `install` and start with warm caches.
 //! A pool of ready workspaces makes spawning a rename-sized operation.
 //! The library holds all logic so other tools can embed it.
 
-#[cfg(not(target_os = "macos"))]
-compile_error!("agent-ws only supports macOS: it needs APFS clonefile(2) and getattrlist(2).");
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+compile_error!(
+    "agent-ws supports macOS (APFS clones) and Linux (Btrfs or XFS reflinks): it needs copy-on-write file clones."
+);
 
 pub mod claude;
 pub mod config;
@@ -608,20 +611,23 @@ impl Repo {
         for d in ["meta", "pool", "ws", ".trash"] {
             std::fs::create_dir_all(self.dir.join(d))?;
         }
-        let top = self.dir.parent().context("no home")?;
         // Keep Spotlight from indexing every new tree, and Time Machine from
         // backing up clones at their full logical size. `tmutil` can take
         // ~10 s, so it runs detached instead of blocking the first spawn.
-        let marker = top.join(".metadata_never_index");
-        if !marker.exists() {
-            std::fs::write(&marker, b"")?;
-            let _ = std::process::Command::new("tmutil")
-                .arg("addexclusion")
-                .arg(top)
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .spawn();
+        #[cfg(target_os = "macos")]
+        {
+            let top = self.dir.parent().context("no home")?;
+            let marker = top.join(".metadata_never_index");
+            if !marker.exists() {
+                std::fs::write(&marker, b"")?;
+                let _ = std::process::Command::new("tmutil")
+                    .arg("addexclusion")
+                    .arg(top)
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn();
+            }
         }
         Ok(())
     }
@@ -848,7 +854,7 @@ impl Repo {
         }
         if fsutil::device(&self.root)? != fsutil::device(&self.dir)? {
             bail!(
-                "{} and {} are on different volumes; clones need one APFS volume (set AGENT_WS_HOME)",
+                "{} and {} are on different volumes; clones need one volume (set AGENT_WS_HOME)",
                 self.root.display(),
                 self.dir.display()
             );
@@ -2379,7 +2385,22 @@ fn delete_in_background(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Start time of a process, only ever compared with another reading on the
+/// same machine: clock ticks since boot (field 22 of `/proc/<pid>/stat`).
+#[cfg(target_os = "linux")]
+fn process_start(pid: u32) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // `pid (comm) state …`: the name may hold spaces and parentheses, so
+    // count fields from the last `)`; the first after it is field 3.
+    stat.get(stat.rfind(')')? + 1..)?
+        .split_whitespace()
+        .nth(19)?
+        .parse()
+        .ok()
+}
+
 /// Start time of a process in microseconds since the epoch.
+#[cfg(target_os = "macos")]
 fn process_start(pid: u32) -> Option<u64> {
     let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
     let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
@@ -2416,5 +2437,6 @@ fn pid_alive(pid: u32, start: u64) -> bool {
         return actual == start;
     }
     // Signal 0 checks existence; EPERM means it exists under another user.
-    unsafe { libc::kill(pid as libc::pid_t, 0) == 0 || *libc::__error() == libc::EPERM }
+    let exists = unsafe { libc::kill(pid as libc::pid_t, 0) } == 0;
+    exists || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }

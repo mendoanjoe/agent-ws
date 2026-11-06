@@ -4,6 +4,7 @@ on:
   push:
     branches: [master]
   pull_request:
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -28,3 +29,36 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.88
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --all-targets
+
+  # Linux needs reflinks: the tests run on a loop-mounted XFS or Btrfs
+  # volume (the runner's own disk is ext4, which has none).
+  linux:
+    name: linux (${{ matrix.fs }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        fs: [xfs, btrfs]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Mount ${{ matrix.fs }}
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq xfsprogs btrfs-progs
+          truncate -s 4G "$RUNNER_TEMP/cow.img"
+          case "${{ matrix.fs }}" in
+            xfs) mkfs.xfs -q -m reflink=1 "$RUNNER_TEMP/cow.img" ;;
+            btrfs) mkfs.btrfs -q "$RUNNER_TEMP/cow.img" ;;
+          esac
+          sudo mkdir /mnt/cow
+          sudo mount -o loop "$RUNNER_TEMP/cow.img" /mnt/cow
+          sudo chown "$USER" /mnt/cow
+          git --version
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test
+        env:
+          TMPDIR: /mnt/cow
