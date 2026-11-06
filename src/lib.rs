@@ -9,6 +9,7 @@
 #[cfg(not(target_os = "macos"))]
 compile_error!("agent-ws only supports macOS: it needs APFS clonefile(2) and getattrlist(2).");
 
+pub mod claude;
 pub mod config;
 pub mod fsutil;
 pub mod git;
@@ -46,6 +47,14 @@ pub const PRUNE_MIN_AGE_SECS: u64 = 3600;
 
 /// The background prune after `spawn` runs at most this often.
 const AUTO_PRUNE_EVERY_SECS: u64 = 600;
+
+/// The background prune drops an unused Claude Code worktree this old.
+const CLAUDE_UNUSED_SECS: u64 = 24 * 3600;
+
+/// `PORT` of slot 0 and the gap between slots, unless configured. Clear of
+/// the usual dev server ports (3000, 4321, 5173, 8787).
+const PORT_BASE: u16 = 4100;
+const PORT_STEP: u16 = 10;
 
 pub struct Repo {
     /// Main checkout of the repository.
@@ -161,6 +170,22 @@ pub struct Spawned {
     pub notes: Notes,
     /// Many workspaces or little free disk: time to `prune`.
     pub warnings: Vec<String>,
+    /// `PORT` for commands in this workspace (see `Repo::env`).
+    pub port: Option<u32>,
+    /// Branch checked out in the workspace (`--branch`).
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub branch: String,
+    /// Paths `--carry` brought along from the source checkout.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub carried: Vec<String>,
+}
+
+/// What `Repo::fill` did to a new workspace.
+struct Filled {
+    clone_ms: u128,
+    calls: usize,
+    notes: Notes,
+    carried: Vec<String>,
 }
 
 /// Disk use of one workspace, pooled workspace or trash entry.
@@ -205,6 +230,10 @@ pub struct Pruned {
     pub reason: String,
     /// Bytes only this workspace holds; deleting it frees at least this.
     pub private_bytes: u64,
+    /// The workspace's own branch (`spawn --branch`), deleted with it
+    /// because the base has all of it (`merged`) or it never moved (`unused`).
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub branch: String,
 }
 
 #[derive(Serialize)]
@@ -274,6 +303,10 @@ pub struct Landed {
     pub dropped: bool,
     /// Landed paths that other workspaces also changed.
     pub overlaps: BTreeMap<String, Vec<String>>,
+    /// The branch was pushed to `origin` (`--pr`).
+    pub pushed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pr_url: Option<String>,
 }
 
 #[derive(Serialize, Default)]
@@ -294,7 +327,7 @@ pub struct PoolStatus {
     pub creating: usize,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct SpawnOpts {
     pub name: String,
     pub base: Option<String>,
@@ -304,6 +337,15 @@ pub struct SpawnOpts {
     pub min_free_bytes: Option<u64>,
     /// Take a ready workspace from the pool when one matches.
     pub use_pool: bool,
+    /// Bring the source checkout's uncommitted edits and untracked files
+    /// along. The base must be HEAD, which they were made on.
+    pub carry: bool,
+    /// Create this branch at the base and check it out (default: detached).
+    pub branch: Option<String>,
+    /// Kept in `Meta::origin`.
+    pub origin: String,
+    /// Skip the `post_spawn` hooks.
+    pub no_hooks: bool,
 }
 
 pub struct LandOpts {
@@ -312,7 +354,42 @@ pub struct LandOpts {
     pub branch: Option<String>,
     pub force_branch: bool,
     pub keep: bool,
+    /// Skip Git's commit hooks and the `pre_land` hooks.
     pub no_verify: bool,
+    /// One commit on top of the base instead of the agent's commits plus one.
+    pub squash: bool,
+    /// Push the branch to `origin` and open a GitHub pull request (`gh`).
+    pub pr: bool,
+    /// Branch the pull request targets (default: the repository's default).
+    pub pr_base: Option<String>,
+    pub draft: bool,
+}
+
+/// One workspace in `list --long`.
+#[derive(Serialize)]
+pub struct WsInfo {
+    #[serde(flatten)]
+    pub meta: Meta,
+    pub age_secs: u64,
+    pub port: Option<u32>,
+    /// Uncommitted changes; `null` when Git cannot read the workspace.
+    pub dirty: Option<bool>,
+    /// Commits since the base.
+    pub ahead: Option<u64>,
+    /// Processes whose current directory is inside (agents, shells).
+    pub processes: Vec<u32>,
+    pub run: Option<RunInfo>,
+    /// Bytes only this workspace holds.
+    pub private_bytes: u64,
+}
+
+/// The last `exec` and whether it still runs.
+#[derive(Serialize)]
+pub struct RunInfo {
+    #[serde(flatten)]
+    pub run: Run,
+    /// `running`, `exited`, or `interrupted` (agent-ws was killed first).
+    pub state: String,
 }
 
 fn home() -> Result<PathBuf> {
@@ -401,6 +478,32 @@ fn read_records(dir: &Path, suffix: &str) -> Vec<(PathBuf, Meta)> {
     out
 }
 
+/// Hold an exclusive `flock` on `path` until the returned file is dropped.
+/// The lock goes away with the process, so a crash cannot leave it held.
+fn lock_file(path: &Path) -> Result<std::fs::File> {
+    use std::os::fd::AsRawFd;
+    let f = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(path)?;
+    while unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) } != 0 {
+        let e = std::io::Error::last_os_error();
+        if e.kind() != std::io::ErrorKind::Interrupted {
+            return Err(e).with_context(|| format!("lock {}", path.display()));
+        }
+    }
+    Ok(f)
+}
+
+/// Write `value` as JSON to `p` by rename, so readers never see half of it.
+fn write_json<T: Serialize>(p: &Path, value: &T) -> Result<()> {
+    let tmp = p.with_extension(format!("tmp.{}", std::process::id()));
+    std::fs::write(&tmp, serde_json::to_vec_pretty(value)?)?;
+    std::fs::rename(tmp, p)?;
+    Ok(())
+}
+
 fn write_record(p: &Path, m: &Meta, create_new: bool) -> Result<()> {
     let raw = serde_json::to_vec_pretty(m)?;
     if create_new {
@@ -449,6 +552,11 @@ impl Repo {
 
     fn meta_path(&self, name: &str) -> PathBuf {
         self.dir.join("meta").join(format!("{name}.json"))
+    }
+
+    /// Whether a workspace record with this name exists (in any state).
+    pub fn exists(&self, name: &str) -> bool {
+        check_name(name).is_ok() && self.meta_path(name).exists()
     }
 
     /// Whether `path` is a workspace folder this tool created: a direct child
@@ -572,16 +680,59 @@ impl Repo {
     pub fn spawn(&self, o: &SpawnOpts) -> Result<Spawned> {
         let t0 = Instant::now();
         check_new_name(&o.name)?;
-        self.prepare_home()?;
-        if o.use_pool && o.exclude.is_empty() && !o.keep_secrets {
-            let head = self.resolve(None)?;
-            if self.resolve(o.base.as_deref())? == head
-                && let Some(mut s) = self.claim(&o.name, &self.pool_key(&head), t0)?
-            {
-                s.warnings = self.spawn_warnings();
-                return Ok(s);
+        if let Some(b) = &o.branch {
+            check_branch(&self.root, b)?;
+            if self.branch_tip(b).is_some() {
+                bail!("branch {b} already exists");
             }
         }
+        let hooks = match o.no_hooks {
+            true => vec![],
+            false
+                if self
+                    .config
+                    .hooks
+                    .as_ref()
+                    .is_some_and(|h| !h.post_spawn.is_empty()) =>
+            {
+                self.trusted_hooks()?.post_spawn
+            }
+            false => vec![],
+        };
+        self.prepare_home()?;
+        let pooled = if o.use_pool && o.exclude.is_empty() && !o.keep_secrets && !o.carry {
+            let head = self.resolve(None)?;
+            match self.resolve(o.base.as_deref())? == head {
+                true => self.claim(o, &self.pool_key(&head))?,
+                false => None,
+            }
+        } else {
+            None
+        };
+        let mut s = match pooled {
+            Some(s) => s,
+            None => self.spawn_fresh(o, t0)?,
+        };
+        // The workspace exists from here on; a failure removes it again so
+        // that a spawn either fully happens or leaves nothing.
+        let finish = || -> Result<()> {
+            let m = self.meta(&o.name)?;
+            if let Some(b) = &o.branch {
+                git::run(&m.path, &["switch", "-q", "-c", b])?;
+            }
+            self.run_hooks("post_spawn", &hooks, &m)
+        };
+        if let Err(e) = finish() {
+            let _ = self.drop(&o.name);
+            return Err(e.context(format!("spawn of {:?} undone", o.name)));
+        }
+        s.total_ms = t0.elapsed().as_millis();
+        s.warnings = self.spawn_warnings();
+        Ok(s)
+    }
+
+    /// Clone a new workspace for `o` and register it.
+    fn spawn_fresh(&self, o: &SpawnOpts, t0: Instant) -> Result<Spawned> {
         let path = self.dir.join("ws").join(&o.name);
         // Claim the name first: the record marks the directory as in use, so
         // `gc` leaves it alone while the owning process is alive.
@@ -597,10 +748,13 @@ impl Repo {
             key: String::new(),
             notes: Notes::default(),
             slot: None,
-            branch: String::new(),
-            origin: String::new(),
+            branch: o.branch.clone().unwrap_or_default(),
+            origin: o.origin.clone(),
         };
-        write_record(&rec, &meta, true)?;
+        self.with_slot(|slot| {
+            meta.slot = Some(slot);
+            write_record(&rec, &meta, true)
+        })?;
         match self.create(o, &path, t0) {
             Ok(mut s) => {
                 meta.base = s.base.clone();
@@ -609,7 +763,8 @@ impl Repo {
                 meta.pid_start = 0;
                 meta.notes = s.notes.clone();
                 write_record(&rec, &meta, false)?;
-                s.warnings = self.spawn_warnings();
+                s.port = self.port(&meta);
+                s.branch = meta.branch;
                 Ok(s)
             }
             Err(e) => {
@@ -619,8 +774,22 @@ impl Repo {
         }
     }
 
-    /// Take a fresh pooled workspace and register it under `name`.
-    fn claim(&self, name: &str, key: &str, t0: Instant) -> Result<Option<Spawned>> {
+    /// Tip of a local branch, if it exists.
+    fn branch_tip(&self, branch: &str) -> Option<String> {
+        git::line(
+            &self.root,
+            &[
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                &format!("refs/heads/{branch}^{{commit}}"),
+            ],
+        )
+        .ok()
+    }
+
+    /// Take a fresh pooled workspace and register it under `o.name`.
+    fn claim(&self, o: &SpawnOpts, key: &str) -> Result<Option<Spawned>> {
         for (rec, m) in read_records(&self.dir.join("pool"), ".json") {
             if m.state != "pooled" || m.key != key || !self.owns(&m.path) {
                 continue;
@@ -635,30 +804,39 @@ impl Repo {
                 let _ = std::fs::remove_file(&claim);
                 continue;
             }
-            let named = Meta {
-                name: name.into(),
+            let mut named = Meta {
+                name: o.name.clone(),
                 created: now(),
                 state: ready(),
                 pid: 0,
                 pid_start: 0,
                 key: String::new(),
+                branch: o.branch.clone().unwrap_or_default(),
+                origin: o.origin.clone(),
                 ..m.clone()
             };
-            if let Err(e) = write_record(&self.meta_path(name), &named, true) {
+            let written = self.with_slot(|slot| {
+                named.slot = Some(slot);
+                write_record(&self.meta_path(&o.name), &named, true)
+            });
+            if let Err(e) = written {
                 let _ = std::fs::rename(&claim, &rec);
                 return Err(e);
             }
             std::fs::remove_file(&claim)?;
             return Ok(Some(Spawned {
-                name: name.into(),
+                name: o.name.clone(),
                 path: m.path,
                 base: m.base,
                 from_pool: true,
                 clone_ms: 0,
-                total_ms: t0.elapsed().as_millis(),
+                total_ms: 0,
                 clone_calls: 0,
                 notes: m.notes,
                 warnings: vec![],
+                port: self.port(&named),
+                branch: named.branch,
+                carried: vec![],
             }));
         }
         Ok(None)
@@ -688,19 +866,25 @@ impl Repo {
             );
         }
         let base = self.resolve(o.base.as_deref())?;
+        if o.carry && base != self.resolve(None)? {
+            bail!("--carry brings changes made on top of HEAD, so the base must be HEAD");
+        }
         let p = path.to_string_lossy().to_string();
         self.worktree(&["add", "--no-checkout", "--detach", &p, &base])?;
         match self.fill(o, path) {
-            Ok((clone_ms, clone_calls, notes)) => Ok(Spawned {
+            Ok(f) => Ok(Spawned {
                 name: o.name.clone(),
                 path: path.to_path_buf(),
                 base,
                 from_pool: false,
-                clone_ms,
+                clone_ms: f.clone_ms,
                 total_ms: t0.elapsed().as_millis(),
-                clone_calls,
-                notes,
+                clone_calls: f.calls,
+                notes: f.notes,
                 warnings: vec![],
+                port: None,
+                branch: String::new(),
+                carried: f.carried,
             }),
             Err(e) => {
                 let _ = self.discard(path);
@@ -710,8 +894,9 @@ impl Repo {
     }
 
     /// Clone the checkout into `path`, then make its tracked files equal the
-    /// worktree's HEAD (the base commit).
-    fn fill(&self, o: &SpawnOpts, path: &Path) -> Result<(u128, usize, Notes)> {
+    /// worktree's HEAD (the base commit), unless `carry` keeps the source's
+    /// uncommitted edits and untracked files.
+    fn fill(&self, o: &SpawnOpts, path: &Path) -> Result<Filled> {
         let mut excludes: Vec<PathBuf> = DEFAULT_EXCLUDES.iter().map(PathBuf::from).collect();
         excludes.extend(
             self.config
@@ -730,8 +915,11 @@ impl Repo {
 
         // Index from the base commit, then drop the source's uncommitted
         // edits and untracked files. Ignored files (deps, caches) stay.
+        // With `carry` the edits stay too, as unstaged changes on HEAD.
         git::run(path, &["reset", "-q"])?;
-        git::run(path, &["checkout", "-q", "-f", "--", "."])?;
+        if !o.carry {
+            git::run(path, &["checkout", "-q", "-f", "--", "."])?;
+        }
         // `clean` removes untracked, not-ignored files. Secrets among them are
         // reported as removed, or set aside and put back with --keep-secrets.
         let untracked = git::run(path, &["ls-files", "-o", "--exclude-standard", "-z"])?;
@@ -746,25 +934,36 @@ impl Repo {
             })
             .map(String::from)
             .collect();
-        let hold = self.dir.join(".trash").join(format!("hold-{}", nanos()));
-        if o.keep_secrets {
+        if o.carry {
+            // Untracked files come along; secrets among them only with
+            // --keep-secrets.
+            if o.keep_secrets {
+                cleaned_secrets.clear();
+            }
             for rel in &cleaned_secrets {
-                let held = hold.join(rel);
-                std::fs::create_dir_all(held.parent().context("no parent")?)?;
-                std::fs::rename(path.join(rel), held)?;
+                std::fs::remove_file(path.join(rel))?;
             }
-        }
-        git::run(path, &["clean", "-fdq"])?;
-        if o.keep_secrets {
-            for rel in cleaned_secrets.drain(..) {
-                let back = path.join(&rel);
-                std::fs::create_dir_all(back.parent().context("no parent")?)?;
-                std::fs::rename(hold.join(&rel), back)?;
+        } else {
+            let hold = self.dir.join(".trash").join(format!("hold-{}", nanos()));
+            if o.keep_secrets {
+                for rel in &cleaned_secrets {
+                    let held = hold.join(rel);
+                    std::fs::create_dir_all(held.parent().context("no parent")?)?;
+                    std::fs::rename(path.join(rel), held)?;
+                }
             }
-            let _ = std::fs::remove_dir_all(&hold);
+            git::run(path, &["clean", "-fdq"])?;
+            if o.keep_secrets {
+                for rel in cleaned_secrets.drain(..) {
+                    let back = path.join(&rel);
+                    std::fs::create_dir_all(back.parent().context("no parent")?)?;
+                    std::fs::rename(hold.join(&rel), back)?;
+                }
+                let _ = std::fs::remove_dir_all(&hold);
+            }
         }
         if path.join(".gitmodules").exists() {
-            isolate_submodules(path, &self.root, "HEAD")?;
+            isolate_submodules(path, &self.root, !o.carry)?;
         }
 
         let tracked: HashSet<String> = git::run(path, &["ls-files", "-z", "--recurse-submodules"])?
@@ -800,7 +999,16 @@ impl Repo {
                 all
             },
         };
-        Ok((clone_ms, calls, notes))
+        let carried = match o.carry {
+            true => git::changed_paths(path, "HEAD")?,
+            false => vec![],
+        };
+        Ok(Filled {
+            clone_ms,
+            calls,
+            notes,
+            carried,
+        })
     }
 
     /// Bring the pool to `size` (default: the configured target) fresh
@@ -845,14 +1053,7 @@ impl Repo {
                 }
             }
         }
-        let opts = SpawnOpts {
-            name: String::new(),
-            base: None,
-            exclude: vec![],
-            keep_secrets: false,
-            min_free_bytes: None,
-            use_pool: false,
-        };
+        let opts = SpawnOpts::default();
         while fresh < target {
             let id = format!("{POOL_PREFIX}{}", nanos());
             let rec = self.dir.join("pool").join(format!("{id}.json"));
@@ -940,22 +1141,115 @@ impl Repo {
     /// their work. The `flock` goes away with the process, so a crash cannot
     /// leave it held.
     fn worktree(&self, args: &[&str]) -> Result<String> {
-        use std::os::fd::AsRawFd;
-        let lock = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(self.dir.join("worktrees.lock"))?;
-        while unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } != 0 {
-            let e = std::io::Error::last_os_error();
-            if e.kind() != std::io::ErrorKind::Interrupted {
-                return Err(e).context("lock worktrees.lock");
-            }
-        }
+        let _lock = lock_file(&self.dir.join("worktrees.lock"))?;
         let args: Vec<&str> = std::iter::once("worktree")
             .chain(args.iter().copied())
             .collect();
         git::run(&self.root, &args)
+    }
+
+    /// Run `write` with the lowest port slot no workspace record holds,
+    /// under `slots.lock`, so parallel spawns get different slots.
+    fn with_slot<T>(&self, write: impl FnOnce(u32) -> Result<T>) -> Result<T> {
+        let _lock = lock_file(&self.dir.join("slots.lock"))?;
+        let used: HashSet<u32> = read_records(&self.dir.join("meta"), ".json")
+            .into_iter()
+            .filter_map(|(_, m)| m.slot)
+            .collect();
+        write((0..).find(|s| !used.contains(s)).unwrap_or(0))
+    }
+
+    /// `PORT` for a workspace: `port_base + slot * port_step`.
+    pub fn port(&self, m: &Meta) -> Option<u32> {
+        let base = u32::from(self.config.port_base.unwrap_or(PORT_BASE));
+        let step = u32::from(self.config.port_step.unwrap_or(PORT_STEP));
+        let port = base + m.slot? * step;
+        (port <= u32::from(u16::MAX)).then_some(port)
+    }
+
+    /// Environment for commands run in a workspace (`exec`, hooks).
+    pub fn env(&self, m: &Meta) -> Vec<(String, String)> {
+        let mut env = vec![
+            ("AGENT_WS_NAME".to_string(), m.name.clone()),
+            (
+                "AGENT_WS_PATH".into(),
+                m.path.to_string_lossy().into_owned(),
+            ),
+            ("AGENT_WS_BASE".into(), m.base.clone()),
+            (
+                "AGENT_WS_REPO".into(),
+                self.root.to_string_lossy().into_owned(),
+            ),
+        ];
+        if let Some(slot) = m.slot {
+            env.push(("AGENT_WS_SLOT".into(), slot.to_string()));
+        }
+        if let Some(port) = self.port(m) {
+            env.push(("AGENT_WS_PORT".into(), port.to_string()));
+            env.push(("PORT".into(), port.to_string()));
+        }
+        env
+    }
+
+    /// The hooks from `.agent-ws.toml`, provided the user trusts this exact
+    /// set (`agent-ws trust`). The file comes with the repository, so
+    /// without this a clone could run any command on `spawn` or `land`.
+    fn trusted_hooks(&self) -> Result<config::Hooks> {
+        let hooks = self.config.hooks.clone().unwrap_or_default();
+        if hooks.is_empty() {
+            return Ok(hooks);
+        }
+        let trusted: Option<config::Hooks> = std::fs::read(self.dir.join("trusted-hooks.json"))
+            .ok()
+            .and_then(|raw| serde_json::from_slice(&raw).ok());
+        if trusted.as_ref() == Some(&hooks) {
+            return Ok(hooks);
+        }
+        let mut list = String::new();
+        for (event, cmds) in [
+            ("post_spawn", &hooks.post_spawn),
+            ("pre_land", &hooks.pre_land),
+        ] {
+            for c in cmds {
+                list.push_str(&format!("\n  {event}: {c}"));
+            }
+        }
+        bail!(
+            "{} has hooks that run commands in your workspaces:{list}\nReview them, then run `agent-ws trust` (or skip them with --no-hooks / --no-verify)",
+            config::FILE
+        )
+    }
+
+    /// Trust the hooks `.agent-ws.toml` has now. Changing them later needs
+    /// another `trust`.
+    pub fn trust(&self) -> Result<config::Hooks> {
+        let hooks = self.config.hooks.clone().unwrap_or_default();
+        self.prepare_home()?;
+        write_json(&self.dir.join("trusted-hooks.json"), &hooks)?;
+        Ok(hooks)
+    }
+
+    /// Run hook commands in a workspace; the first failure stops. Their
+    /// output goes to stderr, so `--json` output and the path printed for
+    /// Claude Code stay clean.
+    fn run_hooks(&self, event: &str, cmds: &[String], m: &Meta) -> Result<()> {
+        use std::os::fd::AsFd;
+        for c in cmds {
+            let out = std::io::stderr().as_fd().try_clone_to_owned()?;
+            let status = std::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg(c)
+                .current_dir(&m.path)
+                .envs(self.env(m))
+                .stdin(std::process::Stdio::null())
+                .stdout(out)
+                .status()
+                .with_context(|| format!("{event} hook `{c}`"))?;
+            if !status.success() {
+                bail!("{event} hook `{c}` failed ({status})");
+            }
+        }
+        Ok(())
     }
 
     /// Workspace directories some record points at, including pool claims.
@@ -1069,6 +1363,9 @@ impl Repo {
             }
         }
         report.trash = self.sweep_trash(dry_run)?;
+        if !dry_run {
+            self.sweep_leftovers();
+        }
         if !dry_run && self.dir.exists() {
             self.worktree(&["prune"])?;
         }
@@ -1191,6 +1488,37 @@ impl Repo {
             }
         }
         Ok(n)
+    }
+
+    /// Run records of dropped workspaces, and snapshot index files that a
+    /// killed process left behind.
+    fn sweep_leftovers(&self) {
+        for e in std::fs::read_dir(self.dir.join("runs"))
+            .into_iter()
+            .flatten()
+            .flatten()
+        {
+            let file = e.file_name().to_string_lossy().into_owned();
+            let name = file.split('.').next().unwrap_or_default();
+            if !self.meta_path(name).exists() {
+                let _ = std::fs::remove_file(e.path());
+            }
+        }
+        for e in std::fs::read_dir(self.scratch())
+            .into_iter()
+            .flatten()
+            .flatten()
+        {
+            let old = e
+                .metadata()
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.elapsed().ok())
+                .is_some_and(|age| age.as_nanos() > TRASH_GRACE_NS);
+            if old {
+                let _ = std::fs::remove_file(e.path());
+            }
+        }
     }
 
     /// Warnings for `spawn`: many workspaces, or little free disk.
@@ -1392,13 +1720,29 @@ impl Repo {
                 kept.push(keep("cannot read HEAD".into()));
                 continue;
             };
+            // The workspace's own branch (`spawn --branch`) goes with it when
+            // it holds nothing the base lacks.
+            let own_branch = || match !m.branch.is_empty()
+                && self.branch_tip(&m.branch).as_deref() == Some(head.as_str())
+            {
+                true => m.branch.clone(),
+                false => String::new(),
+            };
+            // Claude Code never removes a subagent's worktree, so the
+            // automatic prune drops unused ones too, after a day: a long
+            // session may sit in one without changing anything.
+            let stale_claude = m.origin == "claude" && age >= CLAUDE_UNUSED_SECS;
             match self.merged_reason(&m, &head, &base_commit, o.gh) {
-                Some(reason) if o.merged_only && reason == "unused" => {
+                Some(reason) if o.merged_only && reason == "unused" && !stale_claude => {
                     kept.push(keep("unused since spawn".into()))
                 }
                 Some(reason) => pruned.push(Pruned {
                     name: m.name.clone(),
                     path: m.path.clone(),
+                    branch: match reason.as_str() {
+                        "merged" | "unused" => own_branch(),
+                        _ => String::new(),
+                    },
                     reason,
                     private_bytes: 0,
                 }),
@@ -1412,6 +1756,9 @@ impl Repo {
         if !o.dry_run {
             for p in &pruned {
                 self.drop(&p.name)?;
+                if !p.branch.is_empty() {
+                    let _ = git::run(&self.root, &["branch", "-q", "-D", &p.branch]);
+                }
             }
         }
         Ok(Prune {
@@ -1580,32 +1927,58 @@ impl Repo {
         if files.is_empty() {
             bail!("workspace {:?} has no changes", o.name);
         }
+        // A workspace on its own branch (`spawn --branch`) lands there.
         let branch = o
             .branch
             .clone()
-            .unwrap_or_else(|| format!("agent-ws/{}", o.name));
+            .unwrap_or_else(|| match m.branch.is_empty() {
+                true => format!("agent-ws/{}", o.name),
+                false => m.branch.clone(),
+            });
         check_branch(&self.root, &branch)?;
-        let existing = git::line(
-            &self.root,
-            &[
-                "rev-parse",
-                "--verify",
-                "--quiet",
-                &format!("refs/heads/{branch}"),
-            ],
-        )
-        .ok();
+        let pre_land = match o.no_verify {
+            false
+                if self
+                    .config
+                    .hooks
+                    .as_ref()
+                    .is_some_and(|h| !h.pre_land.is_empty()) =>
+            {
+                self.trusted_hooks()?.pre_land
+            }
+            _ => vec![],
+        };
+        let existing = self.branch_tip(&branch);
         let head = git::line(&m.path, &["rev-parse", "HEAD"])?;
+        // The workspace has the branch checked out: its commits move it.
+        let own = git::line(&m.path, &["symbolic-ref", "-q", "--short", "HEAD"])
+            .is_ok_and(|b| b == branch);
         let clean = git::run(&m.path, &["status", "--porcelain"])?
             .trim()
             .is_empty();
+        let landed_by_this = |tip: &str| {
+            git::line(
+                &m.path,
+                &[
+                    "log",
+                    "-1",
+                    "--format=%(trailers:key=Agent-Ws,valueonly)",
+                    tip,
+                ],
+            )
+            .is_ok_and(|n| n == o.name)
+        };
         // An earlier land created the branch at this workspace's HEAD and
         // stopped before removing the workspace: finish that land.
-        let resume = existing.as_deref() == Some(head.as_str()) && clean && head != m.base;
+        let resume = existing.as_deref() == Some(head.as_str())
+            && clean
+            && head != m.base
+            && (!own || landed_by_this(&head));
         // An earlier `land --keep` of this workspace: its tip is an ancestor
         // of HEAD and carries this workspace's trailer, so moving the branch
         // forward loses nothing. Branches anyone else made are left alone.
         let advance = !resume
+            && !own
             && existing.as_deref().is_some_and(|tip| {
                 let ancestor = std::process::Command::new("git")
                     .arg("-C")
@@ -1613,18 +1986,9 @@ impl Repo {
                     .args(["merge-base", "--is-ancestor", tip, &head])
                     .status()
                     .is_ok_and(|s| s.success());
-                let landed_by = git::line(
-                    &m.path,
-                    &[
-                        "log",
-                        "-1",
-                        "--format=%(trailers:key=Agent-Ws,valueonly)",
-                        tip,
-                    ],
-                );
-                ancestor && landed_by.is_ok_and(|n| n == o.name)
+                ancestor && landed_by_this(tip)
             });
-        if existing.is_some() && !resume && !advance && !o.force_branch {
+        if existing.is_some() && !resume && !advance && !own && !o.force_branch {
             bail!(
                 "branch {branch} already exists and does not match this workspace; pass --branch NAME or --force-branch"
             );
@@ -1646,7 +2010,12 @@ impl Repo {
         let commit = if resume {
             head
         } else {
+            self.run_hooks("pre_land", &pre_land, &m)?;
             git::run(&m.path, &["add", "-A"])?;
+            if o.squash {
+                // Everything since the base becomes the one commit below.
+                git::run(&m.path, &["reset", "-q", "--soft", &m.base])?;
+            }
             // Always commit, empty if the agent already committed everything,
             // so the branch tip carries the message and the trailers.
             let ws_trailer = format!("Agent-Ws: {}", o.name);
@@ -1667,13 +2036,23 @@ impl Repo {
             }
             git::run(&m.path, &args)?;
             let commit = git::line(&m.path, &["rev-parse", "HEAD"])?;
-            let flag = if o.force_branch || advance {
-                "-f"
-            } else {
-                "--no-track"
-            };
-            git::run(&self.root, &["branch", flag, &branch, &commit])?;
+            if !own {
+                let flag = if o.force_branch || advance {
+                    "-f"
+                } else {
+                    "--no-track"
+                };
+                git::run(&self.root, &["branch", flag, &branch, &commit])?;
+            }
             commit
+        };
+        // A failed push keeps the workspace, so the same command retries:
+        // it resumes at the landed commit and pushes again.
+        let pr_url = match o.pr {
+            true => Some(self.open_pr(&branch, o, files.len()).with_context(|| {
+                format!("landed on branch {branch}; run the same command again to retry")
+            })?),
+            false => None,
         };
         if !o.keep {
             self.drop(&o.name)?;
@@ -1685,7 +2064,76 @@ impl Repo {
             files: files.len(),
             dropped: !o.keep,
             overlaps,
+            pushed: o.pr,
+            pr_url,
         })
+    }
+
+    /// Push `branch` to `origin`, then open a pull request for it with the
+    /// GitHub CLI, or find the one already open. Returns its URL.
+    fn open_pr(&self, branch: &str, o: &LandOpts, files: usize) -> Result<String> {
+        let refspec = format!("refs/heads/{branch}:refs/heads/{branch}");
+        let mut push = vec!["push", "-q"];
+        if o.force_branch {
+            push.push("--force-with-lease");
+        }
+        push.extend(["origin", &refspec]);
+        git::run(&self.root, &push)?;
+        let gh = |args: &[&str]| -> Result<String> {
+            let out = std::process::Command::new("gh")
+                .current_dir(&self.root)
+                .args(args)
+                .stdin(std::process::Stdio::null())
+                .output()
+                .context("run gh (the GitHub CLI)")?;
+            if !out.status.success() {
+                bail!(
+                    "gh {}: {}",
+                    args.join(" "),
+                    String::from_utf8_lossy(&out.stderr).trim()
+                );
+            }
+            Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+        };
+        let open = gh(&[
+            "pr",
+            "list",
+            "--head",
+            branch,
+            "--state",
+            "open",
+            "--json",
+            "url",
+            "--jq",
+            ".[0].url // empty",
+        ])?;
+        if !open.is_empty() {
+            return Ok(open);
+        }
+        let (title, rest) = o.message.split_once('\n').unwrap_or((&o.message, ""));
+        let body = format!(
+            "{}\n\nLanded with agent-ws from workspace `{}` ({files} files).",
+            rest.trim(),
+            o.name
+        );
+        let mut args = vec![
+            "pr",
+            "create",
+            "--head",
+            branch,
+            "--title",
+            title.trim(),
+            "--body",
+            body.trim_start(),
+        ];
+        if let Some(b) = &o.pr_base {
+            args.extend(["--base", b]);
+        }
+        if o.draft {
+            args.push("--draft");
+        }
+        // `gh pr create` prints the new pull request's URL last.
+        Ok(gh(&args)?.lines().last().unwrap_or_default().to_string())
     }
 
     /// Remove a workspace. The tree is renamed into `.trash` (instant) and
@@ -1694,9 +2142,133 @@ impl Repo {
         let m = self.meta(name)?;
         self.discard(&m.path)?;
         std::fs::remove_file(self.meta_path(name))?;
+        let _ = std::fs::remove_file(self.run_path(name));
+        // The branch `spawn --branch` made holds nothing until it moves.
+        if !m.branch.is_empty() && self.branch_tip(&m.branch).as_deref() == Some(m.base.as_str()) {
+            let _ = git::run(&self.root, &["branch", "-q", "-D", &m.branch]);
+        }
         // Finish deletes that an earlier killed process left in the trash.
         self.sweep_trash(false)?;
         Ok(())
+    }
+
+    fn run_path(&self, name: &str) -> PathBuf {
+        self.dir.join("runs").join(format!("{name}.json"))
+    }
+
+    fn read_run(&self, name: &str) -> Option<Run> {
+        serde_json::from_slice(&std::fs::read(self.run_path(name)).ok()?).ok()
+    }
+
+    /// Keep a run record, unless the workspace was dropped meanwhile.
+    fn write_run(&self, name: &str, run: &Run) {
+        if self.meta_path(name).exists() {
+            let _ = std::fs::create_dir_all(self.dir.join("runs"));
+            let _ = write_json(&self.run_path(name), run);
+        }
+    }
+
+    /// Run `command` in a workspace with its environment (`env`), wait for
+    /// it, and keep how it ended for `list --long`. Ctrl-C reaches the
+    /// command; agent-ws stays to record the result. Returns the exit code,
+    /// 128 + the signal number when the command was killed.
+    pub fn exec(&self, name: &str, command: &[String]) -> Result<i32> {
+        use std::os::unix::process::ExitStatusExt;
+        let m = self.meta(name)?;
+        let (prog, args) = command.split_first().context("no command given")?;
+        let mut child = std::process::Command::new(prog)
+            .args(args)
+            .current_dir(&m.path)
+            .envs(self.env(&m))
+            .spawn()
+            .with_context(|| format!("run {prog}"))?;
+        let restore = ignore_interrupts();
+        let mut run = Run {
+            command: command.to_vec(),
+            pid: child.id(),
+            pid_start: process_start(child.id()).unwrap_or(0),
+            started: now(),
+            ended: None,
+            exit_code: None,
+        };
+        self.write_run(name, &run);
+        let status = child.wait();
+        restore();
+        let status = status?;
+        let code = status
+            .code()
+            .unwrap_or_else(|| 128 + status.signal().unwrap_or(0));
+        run.ended = Some(now());
+        run.exit_code = Some(code);
+        self.write_run(name, &run);
+        Ok(code)
+    }
+
+    /// `list` plus what a coordinator wants to know about each workspace:
+    /// age, port, uncommitted changes, commits, processes inside, the last
+    /// `exec`, and real disk use.
+    pub fn list_long(&self) -> Result<Vec<WsInfo>> {
+        let metas = self.list()?;
+        let users = fsutil::cwd_users(
+            &std::fs::canonicalize(self.dir.join("ws")).unwrap_or(self.dir.join("ws")),
+        );
+        let sizes = usage_parallel(metas.iter().map(|m| m.path.clone()).collect());
+        let now = now();
+        Ok(metas
+            .into_iter()
+            .zip(sizes)
+            .map(|(m, usage)| {
+                let real = std::fs::canonicalize(&m.path).unwrap_or(m.path.clone());
+                let dirty = git::run(&m.path, &["--no-optional-locks", "status", "--porcelain"])
+                    .ok()
+                    .map(|s| !s.trim().is_empty());
+                let ahead = git::line(
+                    &m.path,
+                    &["rev-list", "--count", &format!("{}..HEAD", m.base)],
+                )
+                .ok()
+                .and_then(|n| n.parse().ok());
+                let processes = users
+                    .iter()
+                    .filter(|(_, cwd)| cwd.starts_with(&real))
+                    .map(|(pid, _)| *pid)
+                    .collect();
+                let run = self.read_run(&m.name).map(|run| RunInfo {
+                    state: match run.ended {
+                        Some(_) => "exited",
+                        None if pid_alive(run.pid, run.pid_start) => "running",
+                        None => "interrupted",
+                    }
+                    .into(),
+                    run,
+                });
+                WsInfo {
+                    age_secs: now.saturating_sub(m.created),
+                    port: self.port(&m),
+                    dirty,
+                    ahead,
+                    processes,
+                    run,
+                    private_bytes: usage.private,
+                    meta: m,
+                }
+            })
+            .collect())
+    }
+}
+
+/// Ignore Ctrl-C and Ctrl-\ in this process until the returned closure runs,
+/// so that `exec` outlives the command it waits for. Set after the child
+/// starts: ignored signals would otherwise carry over into it.
+fn ignore_interrupts() -> impl FnOnce() {
+    let previous: Vec<(libc::c_int, libc::sighandler_t)> = [libc::SIGINT, libc::SIGQUIT]
+        .into_iter()
+        .map(|s| (s, unsafe { libc::signal(s, libc::SIG_IGN) }))
+        .collect();
+    move || {
+        for (s, handler) in previous {
+            unsafe { libc::signal(s, handler) };
+        }
     }
 }
 
@@ -1740,15 +2312,16 @@ fn pr_merged_at(root: &Path, branch: &str, head: &str) -> bool {
             .is_ok_and(|prs| prs.iter().any(|p| p["headRefOid"] == head))
 }
 
-/// Give every checked-out submodule its own copy of its git dir, then check
-/// out the commit `rev` records for it (recursively).
+/// Give every checked-out submodule its own copy of its git dir, then, with
+/// `reset`, check out the commit HEAD records for it (recursively). Without
+/// `reset` (`--carry`) each submodule keeps the source's state and edits.
 ///
 /// A cloned submodule has a `.git` file pointing at `../.git/modules/<name>`
 /// relative to the source checkout, which does not exist in a workspace.
 /// Pointing it back at the source's git dir would share its index and HEAD,
 /// so the git dir is cloned instead (copy-on-write, like everything else).
-fn isolate_submodules(ws_repo: &Path, src_repo: &Path, rev: &str) -> Result<()> {
-    let tree = git::run(ws_repo, &["ls-tree", "-r", "-z", rev])?;
+fn isolate_submodules(ws_repo: &Path, src_repo: &Path, reset: bool) -> Result<()> {
+    let tree = git::run(ws_repo, &["ls-tree", "-r", "-z", "HEAD"])?;
     // Entries look like `160000 commit <sha>\t<path>`.
     for entry in tree.split('\0').filter(|e| e.starts_with("160000 ")) {
         let Some((head, rel)) = entry.split_once('\t') else {
@@ -1782,9 +2355,11 @@ fn isolate_submodules(ws_repo: &Path, src_repo: &Path, rev: &str) -> Result<()> 
                 &["config", "--file", &config, "--unset", "core.worktree"],
             );
         }
-        git::run(&ws_sm, &["checkout", "-q", "-f", "--detach", sha])?;
-        git::run(&ws_sm, &["clean", "-fdq"])?;
-        isolate_submodules(&ws_sm, &src_sm, sha)?;
+        if reset {
+            git::run(&ws_sm, &["checkout", "-q", "-f", "--detach", sha])?;
+            git::run(&ws_sm, &["clean", "-fdq"])?;
+        }
+        isolate_submodules(&ws_sm, &src_sm, reset)?;
     }
     Ok(())
 }

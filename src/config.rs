@@ -1,7 +1,7 @@
 //! Per-repository settings from `.agent-ws.toml` at the repository root.
 
 use anyhow::{Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 pub const FILE: &str = ".agent-ws.toml";
@@ -57,6 +57,30 @@ pub struct Config {
     pub warn_workspaces: Option<usize>,
     /// After `spawn`, drop merged workspaces in the background (default on).
     pub auto_prune: Option<bool>,
+    /// `PORT` of the workspace with slot 0 (default 4100).
+    pub port_base: Option<u16>,
+    /// Ports between consecutive slots (default 10).
+    pub port_step: Option<u16>,
+    /// Commands run in workspaces; they run only once trusted (`agent-ws trust`).
+    pub hooks: Option<Hooks>,
+}
+
+/// `[hooks]`: shell commands run in the workspace with its environment.
+#[derive(Deserialize, Serialize, Default, Clone, PartialEq, Debug)]
+#[serde(deny_unknown_fields)]
+pub struct Hooks {
+    /// After `spawn` (also from the pool). A failure removes the workspace.
+    #[serde(default)]
+    pub post_spawn: Vec<String>,
+    /// Before `land` commits. A failure stops the land; `--no-verify` skips.
+    #[serde(default)]
+    pub pre_land: Vec<String>,
+}
+
+impl Hooks {
+    pub fn is_empty(&self) -> bool {
+        self.post_spawn.is_empty() && self.pre_land.is_empty()
+    }
 }
 
 impl Config {

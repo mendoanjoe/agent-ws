@@ -1470,3 +1470,470 @@ fn s2_status_tells_conflicts_from_overlaps_that_merge_cleanly() {
     e.ok(&["status"]);
     assert_eq!(count(), before);
 }
+
+/// The agent-ws binary with this test's home, extra environment, and no
+/// background work.
+fn bin(e: &Env, env: &[(&str, &str)]) -> Command {
+    let mut c = cmd(env!("CARGO_BIN_EXE_agent-ws"), &e.repo);
+    c.env("AGENT_WS_HOME", &e.home)
+        .env("AGENT_WS_NO_REFILL", "1")
+        .env("AGENT_WS_NO_AUTO_PRUNE", "1")
+        .envs(env.iter().copied());
+    c
+}
+
+/// A directory with a stand-in `gh` that logs its arguments to `gh.log`
+/// next to it and answers `pr create` with a URL; PATH with it first.
+fn fake_gh(e: &Env) -> (PathBuf, String) {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = e.home.parent().unwrap().join("fake-gh");
+    fs::create_dir_all(&dir).unwrap();
+    let log = dir.join("gh.log");
+    fs::write(
+        dir.join("gh"),
+        format!(
+            "#!/bin/sh\nprintf '%s|' \"$@\" >> '{}'\necho >> '{}'\n\
+             case \"$1 $2\" in\n  'pr create') echo https://github.com/o/r/pull/7 ;;\nesac\n",
+            log.display(),
+            log.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(dir.join("gh"), fs::Permissions::from_mode(0o755)).unwrap();
+    let path = format!("{}:{}", dir.display(), std::env::var("PATH").unwrap());
+    (log, path)
+}
+
+#[test]
+fn s3_carry_brings_uncommitted_work_along() {
+    let e = Env::new();
+    git(&e.repo, &["commit", "-q", "--allow-empty", "-m", "two"]);
+    e.ok(&["pool", "set", "1"]);
+    e.ok(&["pool", "fill"]);
+    fs::write(e.repo.join("a.txt"), "edited in the checkout\n").unwrap();
+    fs::write(e.repo.join("notes.md"), "draft\n").unwrap();
+    fs::remove_file(e.repo.join("b.txt")).unwrap();
+    fs::write(e.repo.join("id_rsa"), "key").unwrap();
+
+    let s = e.ok(&["spawn", "w", "--carry"]);
+    let ws = path_of(&s);
+    assert_eq!(s["from_pool"], false, "the pool holds clean workspaces");
+    assert_eq!(
+        s["carried"],
+        serde_json::json!(["a.txt", "b.txt", "notes.md"])
+    );
+    assert_eq!(
+        fs::read_to_string(ws.join("a.txt")).unwrap(),
+        "edited in the checkout\n"
+    );
+    assert!(ws.join("notes.md").exists() && !ws.join("b.txt").exists());
+    assert!(!ws.join("id_rsa").exists(), "secrets still stay behind");
+    assert_eq!(
+        e.ok(&["status", "w"])["workspaces"][0]["changed"],
+        serde_json::json!(["a.txt", "b.txt", "notes.md"]),
+        "uncommitted changes on HEAD"
+    );
+    assert_eq!(
+        fs::read_to_string(e.repo.join("a.txt")).unwrap(),
+        "edited in the checkout\n",
+        "the checkout keeps its edits"
+    );
+    let err = e.err(&["spawn", "w2", "--carry", "--base", "HEAD~1"]);
+    assert!(err.contains("base must be HEAD"), "{err}");
+}
+
+#[test]
+fn s4_land_squash_and_pull_request() {
+    let e = Env::new();
+    let ws = path_of(&e.ok(&["spawn", "sq"]));
+    for f in ["c.txt", "d.txt"] {
+        fs::write(ws.join(f), "x\n").unwrap();
+        git(&ws, &["add", "-A"]);
+        git(&ws, &["commit", "-q", "-m", f]);
+    }
+    fs::write(ws.join("e.txt"), "uncommitted\n").unwrap();
+    e.ok(&["land", "sq", "-m", "feat: squashed", "--squash"]);
+    assert_eq!(
+        git(&e.repo, &["rev-list", "--count", "main..agent-ws/sq"]),
+        "1"
+    );
+    assert_eq!(
+        git(&e.repo, &["log", "-1", "--format=%s", "agent-ws/sq"]),
+        "feat: squashed"
+    );
+    let files = git(&e.repo, &["ls-tree", "--name-only", "agent-ws/sq"]);
+    assert!(
+        ["c.txt", "d.txt", "e.txt"]
+            .iter()
+            .all(|f| files.contains(f))
+    );
+
+    // No remote yet: the land stops after the branch, keeping the workspace.
+    let ws = path_of(&e.ok(&["spawn", "feat"]));
+    fs::write(ws.join("f.txt"), "eff\n").unwrap();
+    let (log, path) = fake_gh(&e);
+    let land = || {
+        bin(&e, &[("PATH", &path)])
+            .args(["--json", "land", "feat", "-m", "feat: f\n\nWhy it matters."])
+            .args(["--pr", "--pr-base", "main", "--draft"])
+            .output()
+            .unwrap()
+    };
+    let failed = land();
+    assert!(!failed.status.success());
+    assert!(String::from_utf8_lossy(&failed.stderr).contains("run the same command again"));
+    assert!(ws.exists());
+    let origin = e.home.parent().unwrap().join("origin.git");
+    git(&e.repo, &["init", "-q", "--bare", origin.to_str().unwrap()]);
+    git(
+        &e.repo,
+        &["remote", "add", "origin", origin.to_str().unwrap()],
+    );
+
+    let out = land();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let l: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(l["pr_url"], "https://github.com/o/r/pull/7");
+    assert_eq!(l["pushed"], true);
+    assert_eq!(
+        git(&origin, &["rev-parse", "agent-ws/feat"]),
+        l["commit"].as_str().unwrap()
+    );
+    assert_eq!(
+        git(&e.repo, &["rev-list", "--count", "main..agent-ws/feat"]),
+        "1",
+        "the retry resumed instead of committing again"
+    );
+    // The body spans lines, so the logged `pr create` call does too.
+    let calls = fs::read_to_string(&log).unwrap();
+    let create = &calls[calls.find("pr|create|").unwrap()..];
+    assert!(
+        create.starts_with("pr|create|--head|agent-ws/feat|--title|feat: f|--body|Why it matters."),
+        "{create}"
+    );
+    assert!(
+        create
+            .contains("Landed with agent-ws from workspace `feat` (1 files).|--base|main|--draft|"),
+        "{create}"
+    );
+    assert!(!ws.exists());
+}
+
+#[test]
+fn s5_exec_runs_in_the_workspace_with_its_port_and_records_the_run() {
+    let e = Env::new();
+    let a = path_of(&e.ok(&["spawn", "a"]));
+    assert_eq!(e.ok(&["spawn", "b"])["port"], 4110, "slot 1");
+    let out = e.run(&[
+        "exec",
+        "a",
+        "--",
+        "sh",
+        "-c",
+        "echo \"$PORT $AGENT_WS_NAME $(pwd -P)\"; exit 3",
+    ]);
+    assert_eq!(out.status.code(), Some(3), "the command's exit code");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        format!("4100 a {}", a.canonicalize().unwrap().display())
+    );
+    let long = e.ok(&["list", "--long"]);
+    assert_eq!(long[0]["name"], "a");
+    assert_eq!(long[0]["port"], 4100);
+    assert_eq!(long[0]["run"]["state"], "exited");
+    assert_eq!(long[0]["run"]["exit_code"], 3);
+    assert_eq!(
+        (long[0]["dirty"].clone(), long[0]["ahead"].clone()),
+        (false.into(), 0.into())
+    );
+
+    // A running command shows up, with its process inside the workspace.
+    let mut child = bin(&e, &[])
+        .args(["exec", "b", "--", "sleep", "30"])
+        .spawn()
+        .unwrap();
+    let mut running = serde_json::Value::Null;
+    for _ in 0..100 {
+        running = e.ok(&["list", "--long"])[1].clone();
+        if running["run"]["state"] == "running"
+            && !running["processes"].as_array().unwrap().is_empty()
+        {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert_eq!(running["run"]["state"], "running");
+    let pid = running["run"]["pid"].as_u64().unwrap();
+    assert!(
+        running["processes"]
+            .as_array()
+            .unwrap()
+            .contains(&pid.into())
+    );
+    Command::new("kill").arg(pid.to_string()).status().unwrap();
+    assert_eq!(child.wait().unwrap().code(), Some(143), "128 + SIGTERM");
+    assert_eq!(e.ok(&["list", "--long"])[1]["run"]["exit_code"], 143);
+
+    // Dropping frees the slot; --spawn creates the workspace first.
+    e.ok(&["drop", "a"]);
+    assert_eq!(e.ok(&["spawn", "c"])["port"], 4100);
+    assert!(
+        e.run(&["exec", "d", "--spawn", "--", "true"])
+            .status
+            .success()
+    );
+    assert_eq!(e.ok(&["list"]).as_array().unwrap().len(), 3);
+    assert!(
+        e.err(&["exec", "nope", "--", "true"])
+            .contains("no workspace named")
+    );
+}
+
+#[test]
+fn s6_hooks_run_only_once_trusted() {
+    let e = Env::new();
+    fs::write(
+        e.repo.join(".agent-ws.toml"),
+        "[hooks]\npost_spawn = [\"echo \\\"$AGENT_WS_NAME:$PORT\\\" > .ready; echo noisy\"]\npre_land = [\"test -f ok\"]\n",
+    )
+    .unwrap();
+    let err = e.err(&["spawn", "w"]);
+    assert!(
+        err.contains("agent-ws trust") && err.contains("post_spawn: echo"),
+        "{err}"
+    );
+    assert!(e.ok(&["list"]).as_array().unwrap().is_empty());
+
+    e.ok(&["trust"]);
+    // `ok` parses stdout as JSON: the hook's own output went to stderr.
+    let ws = path_of(&e.ok(&["spawn", "w"]));
+    assert_eq!(fs::read_to_string(ws.join(".ready")).unwrap(), "w:4100\n");
+    fs::write(ws.join("a.txt"), "x\n").unwrap();
+    let head = git(&ws, &["rev-parse", "HEAD"]);
+    assert!(
+        e.err(&["land", "w", "-m", "x"])
+            .contains("pre_land hook `test -f ok` failed")
+    );
+    assert_eq!(git(&ws, &["rev-parse", "HEAD"]), head, "nothing committed");
+    fs::write(ws.join("ok"), "").unwrap();
+    e.ok(&["land", "w", "-m", "x"]);
+
+    // Changed hooks need trust again; a failing post_spawn undoes the spawn.
+    fs::write(
+        e.repo.join(".agent-ws.toml"),
+        "[hooks]\npost_spawn = [\"exit 7\"]\n",
+    )
+    .unwrap();
+    assert!(e.err(&["spawn", "v"]).contains("agent-ws trust"));
+    e.ok(&["trust"]);
+    let err = e.err(&["spawn", "v"]);
+    assert!(err.contains("post_spawn hook `exit 7` failed"), "{err}");
+    assert!(e.ok(&["list"]).as_array().unwrap().is_empty());
+    assert!(!home_dir(&e).join("ws/v").exists());
+    e.ok(&["spawn", "v", "--no-hooks"]);
+}
+
+/// Run `agent-ws claude hook` with Claude Code's JSON on stdin.
+fn claude_hook(e: &Env, input: serde_json::Value) -> Output {
+    use std::io::Write;
+    let mut child = bin(e, &[])
+        .args(["claude", "hook"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(input.to_string().as_bytes())
+        .unwrap();
+    child.wait_with_output().unwrap()
+}
+
+#[test]
+fn s7_claude_code_worktrees_come_from_agent_ws() {
+    let e = Env::new();
+    let create = |name: &str| {
+        let out = claude_hook(
+            &e,
+            serde_json::json!({"session_id": "s", "cwd": e.repo, "hook_event_name": "WorktreeCreate", "name": name}),
+        );
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stdout = String::from_utf8(out.stdout).unwrap();
+        assert_eq!(
+            stdout.lines().count(),
+            1,
+            "stdout is the path alone: {stdout:?}"
+        );
+        PathBuf::from(stdout.trim())
+    };
+    let remove = |p: &Path| {
+        claude_hook(
+            &e,
+            serde_json::json!({"session_id": "s", "cwd": e.repo, "hook_event_name": "WorktreeRemove", "worktree_path": p}),
+        )
+    };
+    let ws = create("bold-oak-a3f2");
+    assert!(
+        ws.join("node_modules/dep/index.js").exists(),
+        "dependencies come along"
+    );
+    assert_eq!(
+        git(&ws, &["symbolic-ref", "--short", "HEAD"]),
+        "agent-ws/bold-oak-a3f2"
+    );
+    let again = create("bold-oak-a3f2");
+    assert!(again.ends_with("bold-oak-a3f2-2"), "{}", again.display());
+    assert_eq!(e.ok(&["list"])[0]["origin"], "claude");
+
+    // The session's commits outlive the worktree on its branch.
+    fs::write(ws.join("c.txt"), "see\n").unwrap();
+    git(&ws, &["add", "-A"]);
+    git(&ws, &["commit", "-q", "-m", "c"]);
+    assert!(remove(&ws).status.success());
+    assert!(!ws.exists());
+    assert_eq!(
+        git(
+            &e.repo,
+            &["log", "-1", "--format=%s", "agent-ws/bold-oak-a3f2"]
+        ),
+        "c"
+    );
+    // An unused one leaves no branch behind.
+    assert!(remove(&again).status.success());
+    let gone = cmd("git", &e.repo)
+        .args([
+            "rev-parse",
+            "--verify",
+            "-q",
+            "refs/heads/agent-ws/bold-oak-a3f2-2",
+        ])
+        .status()
+        .unwrap();
+    assert!(!gone.success());
+    // A folder agent-ws does not own stays; one already gone counts as removed.
+    let out = remove(&e.repo.join("out"));
+    assert!(!out.status.success());
+    assert!(e.repo.join("out").exists());
+    assert!(remove(&e.home.join("ws-already-gone")).status.success());
+}
+
+#[test]
+fn s8_claude_install_keeps_the_rest_of_the_settings() {
+    let e = Env::new();
+    let settings = e.repo.join(".claude/settings.local.json");
+    fs::write(
+        &settings,
+        r#"{"permissions": {"allow": ["Bash(ls)"]}, "hooks": {"Stop": [{"hooks": [{"type": "command", "command": "say done"}]}]}, "model": "opus"}"#,
+    )
+    .unwrap();
+    assert_eq!(e.ok(&["claude", "install"])["changed"], true);
+    let read =
+        || -> serde_json::Value { serde_json::from_slice(&fs::read(&settings).unwrap()).unwrap() };
+    let v = read();
+    let keys: Vec<&String> = v.as_object().unwrap().keys().collect();
+    assert_eq!(keys, ["permissions", "hooks", "model"], "key order kept");
+    assert_eq!(v["hooks"]["Stop"][0]["hooks"][0]["command"], "say done");
+    for event in ["WorktreeCreate", "WorktreeRemove"] {
+        assert_eq!(
+            v["hooks"][event][0]["hooks"][0]["command"],
+            "agent-ws claude hook"
+        );
+    }
+    assert_eq!(
+        e.ok(&["claude", "install"])["changed"],
+        false,
+        "installs once"
+    );
+    assert_eq!(e.ok(&["claude", "uninstall"])["changed"], true);
+    let v = read();
+    assert!(v["hooks"].get("WorktreeCreate").is_none());
+    assert_eq!(v["hooks"]["Stop"][0]["hooks"][0]["command"], "say done");
+
+    // --scope user writes where Claude Code reads it, never a real home here.
+    let config = e.home.parent().unwrap().join("claude-config");
+    let out = bin(&e, &[("CLAUDE_CONFIG_DIR", config.to_str().unwrap())])
+        .args(["--json", "claude", "install", "--scope", "user"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert!(
+        fs::read_to_string(config.join("settings.json"))
+            .unwrap()
+            .contains("agent-ws claude hook")
+    );
+}
+
+#[test]
+fn s9_prune_cleans_up_claude_worktrees_and_merged_branches() {
+    let e = Env::new();
+    let set_created = |name: &str, created: u64| {
+        let p = home_dir(&e).join(format!("meta/{name}.json"));
+        let mut m: serde_json::Value = serde_json::from_slice(&fs::read(&p).unwrap()).unwrap();
+        m["created"] = created.into();
+        fs::write(p, serde_json::to_vec(&m).unwrap()).unwrap();
+    };
+    let age = |name: &str| set_created(name, 0);
+    e.ok(&["spawn", "idle"]);
+    for name in ["sub", "young"] {
+        let out = claude_hook(
+            &e,
+            serde_json::json!({"cwd": e.repo, "hook_event_name": "WorktreeCreate", "name": name}),
+        );
+        assert!(out.status.success());
+    }
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    set_created("young", now - 2 * 3600);
+    let feat = path_of(&e.ok(&["spawn", "feat", "--branch", "feature/x"]));
+    fs::write(feat.join("c.txt"), "see\n").unwrap();
+    git(&feat, &["add", "-A"]);
+    git(&feat, &["commit", "-q", "-m", "c"]);
+    git(&e.repo, &["merge", "-q", "--ff-only", "feature/x"]);
+    for n in ["idle", "sub", "feat"] {
+        age(n);
+    }
+
+    // The automatic prune keeps unused workspaces, except Claude Code's,
+    // which Claude never removes itself.
+    let p = e.ok(&["prune", "--merged-only", "--base", "main"]);
+    assert_eq!(names(&p, "pruned"), ["feat", "sub"]);
+    assert_eq!(
+        names(&p, "kept"),
+        ["idle", "young"],
+        "a Claude worktree gets a day"
+    );
+    let branches = git(&e.repo, &["branch", "--format=%(refname:short)"]);
+    assert!(
+        !branches.contains("feature/x") && !branches.contains("agent-ws/sub"),
+        "{branches}"
+    );
+}
+
+#[test]
+fn s10_completions_need_no_repository() {
+    let e = Env::new();
+    for shell in ["bash", "zsh", "fish"] {
+        let out = cmd(env!("CARGO_BIN_EXE_agent-ws"), e.home.parent().unwrap())
+            .args(["completions", shell])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{shell}");
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains("agent-ws"),
+            "{shell}"
+        );
+    }
+}
