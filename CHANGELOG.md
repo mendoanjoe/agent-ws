@@ -28,6 +28,9 @@ All notable changes to agent-ws are listed here. The format follows
 - `land` no longer fails when another workspace cannot be read by Git; that
   workspace is left out of the overlap check. `status` names the workspace
   in its error.
+- Lands and drops run in parallel no longer fail with `git worktree prune:
+  fatal: Invalid path '.../.git/worktrees'` (Git 2.56) after doing their
+  work. `git worktree add` and `prune` now take turns.
 - The published crate holds only the source, tests, README, license and
   changelog.
 

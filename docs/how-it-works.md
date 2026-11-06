@@ -169,7 +169,9 @@ every process of the user.
 
 - Spawn, land, drop and pool fills are safe in parallel. A spawn claims its
   name with an exclusive create before any work, so same-name spawns have
-  exactly one winner.
+  exactly one winner. `git worktree add` and `git worktree prune` take
+  turns (`flock` on `worktrees.lock`): `prune` deletes `.git/worktrees` once
+  it is empty, and a parallel prune or add would then fail.
 - Records of work in progress store the pid and the process start time.
   `gc` removes spawns, pool fills and pool claims whose process died
   (a later process that got the same pid does not count as alive), records of

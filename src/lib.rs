@@ -634,10 +634,7 @@ impl Repo {
         }
         let base = self.resolve(o.base.as_deref())?;
         let p = path.to_string_lossy().to_string();
-        git::run(
-            &self.root,
-            &["worktree", "add", "--no-checkout", "--detach", &p, &base],
-        )?;
+        self.worktree(&["add", "--no-checkout", "--detach", &p, &base])?;
         match self.fill(o, path) {
             Ok((clone_ms, clone_calls, notes)) => Ok(Spawned {
                 name: o.name.clone(),
@@ -874,8 +871,33 @@ impl Repo {
             std::fs::rename(path, &trash)?;
             delete_in_background(&trash)?;
         }
-        git::run(&self.root, &["worktree", "prune"])?;
+        self.worktree(&["prune"])?;
         Ok(())
+    }
+
+    /// Run `git worktree <args>` in the source repository, one agent-ws
+    /// process at a time. `prune` deletes `.git/worktrees` once it is empty,
+    /// and Git 2.56 dies with "Invalid path" when a parallel prune or `add`
+    /// is still using it, so parallel lands and drops failed after doing
+    /// their work. The `flock` goes away with the process, so a crash cannot
+    /// leave it held.
+    fn worktree(&self, args: &[&str]) -> Result<String> {
+        use std::os::fd::AsRawFd;
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(self.dir.join("worktrees.lock"))?;
+        while unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } != 0 {
+            let e = std::io::Error::last_os_error();
+            if e.kind() != std::io::ErrorKind::Interrupted {
+                return Err(e).context("lock worktrees.lock");
+            }
+        }
+        let args: Vec<&str> = std::iter::once("worktree")
+            .chain(args.iter().copied())
+            .collect();
+        git::run(&self.root, &args)
     }
 
     /// Workspace directories some record points at, including pool claims.
@@ -990,7 +1012,7 @@ impl Repo {
         }
         report.trash = self.sweep_trash(dry_run)?;
         if !dry_run && self.dir.exists() {
-            git::run(&self.root, &["worktree", "prune"])?;
+            self.worktree(&["prune"])?;
         }
         report.orphans.sort();
         report.adopted.sort();

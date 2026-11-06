@@ -1365,3 +1365,35 @@ fn r5_a_broken_workspace_does_not_block_landing_another() {
     // `status` still fails, and says which workspace Git cannot read.
     assert!(e.err(&["status"]).contains("broken"));
 }
+
+#[test]
+fn r6_worktree_registry_changes_take_turns() {
+    use std::os::fd::AsRawFd;
+    // `git worktree prune` deletes `.git/worktrees` once it is empty, and
+    // Git 2.56 dies with "Invalid path" when a parallel prune or add still
+    // uses it: lands and drops in parallel failed after doing their work.
+    // Hold the lock another agent-ws process would hold: drop must wait.
+    let e = Env::new();
+    e.ok(&["spawn", "w"]);
+    let lock = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(home_dir(&e).join("worktrees.lock"))
+        .unwrap();
+    assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) }, 0);
+    let mut child = cmd(env!("CARGO_BIN_EXE_agent-ws"), &e.repo)
+        .env("AGENT_WS_HOME", &e.home)
+        .env("AGENT_WS_NO_REFILL", "1")
+        .env("AGENT_WS_NO_AUTO_PRUNE", "1")
+        .args(["drop", "w"])
+        .spawn()
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    let early = child.try_wait().unwrap();
+    drop(lock);
+    let status = child.wait().unwrap();
+    assert!(early.is_none(), "drop waits for the worktree lock");
+    assert!(status.success());
+    assert_eq!(git(&e.repo, &["worktree", "list"]).lines().count(), 1);
+}
