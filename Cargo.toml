@@ -1,6 +1,6 @@
 [package]
 name = "agent-ws"
-version = "0.2.2"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.88"
 description = "Instant, isolated workspaces for coding agents: copy-on-write clones on macOS (APFS) and Linux (Btrfs, XFS)"
