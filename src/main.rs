@@ -327,9 +327,10 @@ fn claude_cmd(json: bool, cmd: ClaudeCmd) -> Result<i32> {
                 json,
                 &serde_json::json!({ "settings": path, "changed": changed }),
                 |_| {
-                    match changed {
-                        true => println!("added the agent-ws worktree hooks to {}", path.display()),
-                        false => println!("agent-ws hooks already in {}", path.display()),
+                    if changed {
+                        println!("added the agent-ws worktree hooks to {}", path.display());
+                    } else {
+                        println!("agent-ws hooks already in {}", path.display());
                     }
                     println!(
                         "Claude Code worktrees (--worktree, isolation: \"worktree\") now come from agent-ws; Claude Code runs `{}`, so `agent-ws` must be on its PATH",
@@ -347,9 +348,12 @@ fn claude_cmd(json: bool, cmd: ClaudeCmd) -> Result<i32> {
             print(
                 json,
                 &serde_json::json!({ "settings": path, "changed": changed }),
-                |_| match changed {
-                    true => println!("removed the agent-ws hooks from {}", path.display()),
-                    false => println!("no agent-ws hooks in {}", path.display()),
+                |_| {
+                    if changed {
+                        println!("removed the agent-ws hooks from {}", path.display());
+                    } else {
+                        println!("no agent-ws hooks in {}", path.display());
+                    }
                 },
             )
         }
@@ -513,9 +517,10 @@ fn repo_cmd(json: bool, repo: &Repo, cmd: Cmd) -> Result<i32> {
                         if let Some(n) = ahead.filter(|n| *n > 0) {
                             parts.push(format!("+{n}"));
                         }
-                        match parts.is_empty() {
-                            true => "clean".into(),
-                            false => parts.join(" "),
+                        if parts.is_empty() {
+                            "clean".into()
+                        } else {
+                            parts.join(" ")
                         }
                     }
                 };
@@ -699,9 +704,10 @@ fn repo_cmd(json: bool, repo: &Repo, cmd: Cmd) -> Result<i32> {
             |p| {
                 let verb = if dry_run { "would drop" } else { "dropped" };
                 for w in &p.pruned {
-                    let branch = match w.branch.is_empty() {
-                        true => String::new(),
-                        false => format!(" (and branch {})", w.branch),
+                    let branch = if w.branch.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" (and branch {})", w.branch)
                     };
                     println!(
                         "{verb} {:20} {:>9}  {}{branch}",

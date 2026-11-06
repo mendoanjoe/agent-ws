@@ -153,12 +153,13 @@ pub fn uninstall(path: &Path) -> Result<bool> {
 fn workspace_name(name: &str) -> String {
     let name: String = name
         .chars()
-        .map(
-            |c| match c.is_ascii_alphanumeric() || c == '_' || c == '-' {
-                true => c,
-                false => '-',
-            },
-        )
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '-'
+            }
+        })
         .collect();
     match name.trim_matches('-') {
         "" => "claude".into(),
@@ -174,9 +175,10 @@ impl Repo {
     pub fn claude_create(&self, name: &str) -> Result<Spawned> {
         let base = workspace_name(name);
         for i in 1..=100 {
-            let name = match i {
-                1 => base.clone(),
-                _ => format!("{base}-{i}"),
+            let name = if i == 1 {
+                base.clone()
+            } else {
+                format!("{base}-{i}")
             };
             let branch = format!("agent-ws/{name}");
             if self.meta_path(&name).exists() || self.branch_tip(&branch).is_some() {

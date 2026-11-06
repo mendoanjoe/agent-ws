@@ -692,29 +692,18 @@ impl Repo {
                 bail!("branch {b} already exists");
             }
         }
-        let hooks = match o.no_hooks {
-            true => vec![],
-            false
-                if self
-                    .config
-                    .hooks
-                    .as_ref()
-                    .is_some_and(|h| !h.post_spawn.is_empty()) =>
-            {
-                self.trusted_hooks()?.post_spawn
-            }
-            false => vec![],
+        let hooks = match &self.config.hooks {
+            Some(h) if !o.no_hooks && !h.post_spawn.is_empty() => self.trusted_hooks()?.post_spawn,
+            _ => vec![],
         };
         self.prepare_home()?;
-        let pooled = if o.use_pool && o.exclude.is_empty() && !o.keep_secrets && !o.carry {
+        let mut pooled = None;
+        if o.use_pool && o.exclude.is_empty() && !o.keep_secrets && !o.carry {
             let head = self.resolve(None)?;
-            match self.resolve(o.base.as_deref())? == head {
-                true => self.claim(o, &self.pool_key(&head))?,
-                false => None,
+            if self.resolve(o.base.as_deref())? == head {
+                pooled = self.claim(o, &self.pool_key(&head))?;
             }
-        } else {
-            None
-        };
+        }
         let mut s = match pooled {
             Some(s) => s,
             None => self.spawn_fresh(o, t0)?,
@@ -1005,9 +994,10 @@ impl Repo {
                 all
             },
         };
-        let carried = match o.carry {
-            true => git::changed_paths(path, "HEAD")?,
-            false => vec![],
+        let carried = if o.carry {
+            git::changed_paths(path, "HEAD")?
+        } else {
+            vec![]
         };
         Ok(Filled {
             clone_ms,
@@ -1728,11 +1718,14 @@ impl Repo {
             };
             // The workspace's own branch (`spawn --branch`) goes with it when
             // it holds nothing the base lacks.
-            let own_branch = || match !m.branch.is_empty()
-                && self.branch_tip(&m.branch).as_deref() == Some(head.as_str())
-            {
-                true => m.branch.clone(),
-                false => String::new(),
+            let own_branch = || {
+                if !m.branch.is_empty()
+                    && self.branch_tip(&m.branch).as_deref() == Some(head.as_str())
+                {
+                    m.branch.clone()
+                } else {
+                    String::new()
+                }
             };
             // Claude Code never removes a subagent's worktree, so the
             // automatic prune drops unused ones too, after a day: a long
@@ -1934,24 +1927,16 @@ impl Repo {
             bail!("workspace {:?} has no changes", o.name);
         }
         // A workspace on its own branch (`spawn --branch`) lands there.
-        let branch = o
-            .branch
-            .clone()
-            .unwrap_or_else(|| match m.branch.is_empty() {
-                true => format!("agent-ws/{}", o.name),
-                false => m.branch.clone(),
-            });
-        check_branch(&self.root, &branch)?;
-        let pre_land = match o.no_verify {
-            false
-                if self
-                    .config
-                    .hooks
-                    .as_ref()
-                    .is_some_and(|h| !h.pre_land.is_empty()) =>
-            {
-                self.trusted_hooks()?.pre_land
+        let branch = o.branch.clone().unwrap_or_else(|| {
+            if m.branch.is_empty() {
+                format!("agent-ws/{}", o.name)
+            } else {
+                m.branch.clone()
             }
+        });
+        check_branch(&self.root, &branch)?;
+        let pre_land = match &self.config.hooks {
+            Some(h) if !o.no_verify && !h.pre_land.is_empty() => self.trusted_hooks()?.pre_land,
             _ => vec![],
         };
         let existing = self.branch_tip(&branch);
@@ -2054,12 +2039,13 @@ impl Repo {
         };
         // A failed push keeps the workspace, so the same command retries:
         // it resumes at the landed commit and pushes again.
-        let pr_url = match o.pr {
-            true => Some(self.open_pr(&branch, o, files.len()).with_context(|| {
+        let mut pr_url = None;
+        if o.pr {
+            let url = self.open_pr(&branch, o, files.len()).with_context(|| {
                 format!("landed on branch {branch}; run the same command again to retry")
-            })?),
-            false => None,
-        };
+            })?;
+            pr_url = Some(url);
+        }
         if !o.keep {
             self.drop(&o.name)?;
         }
