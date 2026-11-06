@@ -20,7 +20,7 @@ jobs:
       matrix:
         target: [aarch64-apple-darwin, x86_64-apple-darwin]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -29,7 +29,7 @@ jobs:
         run: |
           tar -C target/${{ matrix.target }}/release -czf agent-ws-${{ matrix.target }}.tar.gz agent-ws
           shasum -a 256 agent-ws-${{ matrix.target }}.tar.gz > agent-ws-${{ matrix.target }}.tar.gz.sha256
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: agent-ws-${{ matrix.target }}
           path: agent-ws-${{ matrix.target }}.tar.gz*
@@ -38,8 +38,8 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
