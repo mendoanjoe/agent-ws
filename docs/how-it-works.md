@@ -306,6 +306,8 @@ meta/<name>.json         named workspaces
 pool/<id>.json           pooled workspaces (id = @pool-<nanos>)
 ws/<name or id>/         the workspace trees (Git worktrees)
 runs/<name>.json         the last `exec` in each workspace
+runs/<name>.log          its output, with `exec --log` (default without a terminal)
+repo.json                where the checkout is, for `agent-ws repos` and the app
 tmp/                     index copies for snapshots, deleted after use
 .trash/                  trees being deleted in the background
 pool.json, pool.lock     pool target and fill lock
@@ -332,5 +334,6 @@ workspaces and index copies a killed process left in `tmp/`.
 | `src/main.rs` | thin CLI (clap), background refill, completions |
 | `tests/cli.rs` | end-to-end tests on throwaway repositories |
 | `bench/bench.sh` | benchmark against `git worktree` |
+| `desktop/` | the desktop app (Tauri): a window and a menu-bar icon over the same library; see `desktop/README.md` |
 
 All logic lives in the library so other tools can embed it.

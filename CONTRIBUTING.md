@@ -35,6 +35,19 @@ cargo test
 All three must pass. Run `cargo test` a few times when you touch anything
 concurrent; flaky tests are bugs.
 
+They cover the CLI and the library only. When you change the desktop app,
+also run, in `desktop/`:
+
+```sh
+cargo fmt --all
+npm run build                                          # type-check and bundle the window
+cargo clippy -p agent-ws-desktop --all-targets -- -D warnings
+npm run tauri dev                                      # and try it
+```
+
+The app's commands only call the library; keep logic there, where the tests
+reach it.
+
 ## Tests
 
 - `tests/cli.rs` runs the real binary against throwaway repositories in a

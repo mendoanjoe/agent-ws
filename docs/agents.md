@@ -157,11 +157,12 @@ until you `land`.
 agent-ws pool set 4
 
 for t in auth ui perf docs; do
-  agent-ws exec "$t" --spawn -- my-agent -p "Task $t: ..." &
+  agent-ws exec "$t" --spawn --log -- my-agent -p "Task $t: ..." &
 done
 wait
 
 agent-ws list --long            # exit code of each agent, changes, disk use
+agent-ws log perf               # what one of them printed
 agent-ws status                 # OVERLAP: two agents touched one file
                                 # CONFLICT: their changes do not merge
 agent-ws diff auth              # review one before landing it

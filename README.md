@@ -97,7 +97,7 @@ Several agents in parallel:
 ```sh
 agent-ws pool set 4                  # keep 4 workspaces ready
 for t in a b c d; do
-  agent-ws exec "$t" --spawn -- my-agent --task "$t" &
+  agent-ws exec "$t" --spawn --log -- my-agent --task "$t" &
 done
 wait
 agent-ws status                      # OVERLAP: two agents touched one file;
@@ -138,9 +138,11 @@ Every command accepts `--json` for scripts.
 | Command | What it does |
 | --- | --- |
 | `spawn NAME` | Create a workspace. `--base REV`, `--exclude PATH`, `--keep-secrets`, `--no-pool`, `--min-free-gb N`, `--carry` (bring your uncommitted edits), `--branch B` (check out a new branch), `--no-hooks` |
-| `exec NAME -- CMD` | Run a command in the workspace with `PORT` and `AGENT_WS_*` set; exits with its code. `--spawn`, `--base REV` |
+| `exec NAME -- CMD` | Run a command in the workspace with `PORT` and `AGENT_WS_*` set; exits with its code. `--spawn`, `--base REV`, `--log` (keep the output; on by default without a terminal) |
+| `log NAME` | Print the output of the last `exec --log` |
 | `path NAME` | Print the workspace folder |
-| `list` | List workspaces. `--long`: age, port, changes, processes inside, last `exec`, real disk use |
+| `list` | List workspaces. `--long`: age, port, changes, processes inside, last `exec`, real disk use (`--no-disk` skips the last, which reads every file) |
+| `repos` | Every repository agent-ws keeps workspaces for |
 | `status [NAME]` | Changed files per workspace, files changed in more than one (`OVERLAP`), and pairs whose changes conflict (`CONFLICT`) |
 | `diff NAME [PATH…]` | What the workspace changed since its base, new files included. `--stat`; `--json` gives files with line counts |
 | `land NAME -m MSG` | Commit, create branch `agent-ws/NAME`, remove the workspace. `--branch B`, `--keep`, `--no-verify`, `--force-branch`, `--squash`, `--pr` (`--pr-base B`, `--draft`) |
@@ -152,6 +154,30 @@ Every command accepts `--json` for scripts.
 | `trust` | Allow the hooks in `.agent-ws.toml` to run (again after they change) |
 | `claude install` / `uninstall` | Make Claude Code create its worktrees with agent-ws. `--scope local\|project\|user` |
 | `completions SHELL` | Print a completion script for bash, zsh, fish, elvish or powershell |
+
+## Desktop app
+
+`desktop/` holds a small app (Tauri) for the same workspaces, on macOS and
+Linux: every repository in a sidebar, its workspaces in a table that updates
+by itself (age, port, last `exec`, changes, processes inside, real disk use),
+`CONFLICT` and `OVERLAP` lines, and for the selected workspace its diff and
+`exec` log. It opens a workspace in your editor, a terminal, the file manager
+or the browser at its `PORT`, and lands (squash, pull request), drops and
+prunes. A menu-bar icon counts the agents running and a notification says when
+one finishes or fails. It uses the agent-ws library directly, so it shows
+exactly what the CLI shows.
+
+Build it from a clone (Node 20+ and the [Tauri prerequisites](https://tauri.app/start/prerequisites/)):
+
+```sh
+cd desktop
+npm install
+npm run tauri dev                       # run it
+npm run tauri build                     # .app/.dmg on macOS, AppImage/.deb on Linux
+```
+
+Releases tagged `desktop-v*` carry a built app. It is not signed yet: on macOS,
+right-click it and choose Open the first time.
 
 ## What a workspace contains
 

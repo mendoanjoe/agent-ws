@@ -6,6 +6,25 @@ All notable changes to agent-ws are listed here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- **Desktop app** in `desktop/` (Tauri, macOS and Linux): every repository's
+  workspaces in one window that updates by itself, `CONFLICT`/`OVERLAP` lines,
+  the diff and `exec` log of a workspace, open in editor/terminal/files/browser
+  at its `PORT`, land (squash, pull request), drop and prune, a menu-bar count
+  of running agents and a notification when one finishes. Released separately,
+  with tags `desktop-v*`.
+- `agent-ws repos` lists every repository agent-ws keeps workspaces for (the
+  state folder now notes its checkout in `repo.json`).
+- `exec` keeps the command's output in a log, read with `agent-ws log NAME`:
+  with `--log`, and by default when stdout is not a terminal.
+- `list --long --no-disk` skips the real disk use, which reads every file.
+
+### Fixed
+
+- `gc` removed the run records of workspaces with a dot in their name (such as
+  `v1.2`), taking the name only up to the first dot.
+
 ## [0.3.0] - 2026-11-06
 
 ### Added
