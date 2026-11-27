@@ -2,10 +2,9 @@
 //! thread, so the window stays responsive while Git works.
 
 use agent_ws::{
-    FileChange, KnownRepo, LandOpts, Landed, Prune, PruneOpts, Repo, Status, WsInfo, WsUsage,
+    DiffBundle, KnownRepo, LandOpts, Landed, Prune, PruneOpts, Repo, Status, WsInfo, WsUsage,
 };
 use anyhow::Context;
-use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -61,41 +60,9 @@ pub async fn status(root: String) -> Res<Status> {
     blocking(move || repo(&root)?.status(None)).await
 }
 
-#[derive(Serialize)]
-pub struct Diff {
-    files: Vec<FileChange>,
-    patch: String,
-    truncated: bool,
-}
-
-fn cap_patch_lines(mut patch: String, max_lines: usize) -> (String, bool) {
-    if max_lines == 0 {
-        let truncated = !patch.is_empty();
-        patch.clear();
-        return (patch, truncated);
-    }
-    if let Some((end_idx, _)) = patch.match_indices('\n').nth(max_lines - 1)
-        && end_idx + 1 < patch.len()
-    {
-        patch.truncate(end_idx + 1);
-        return (patch, true);
-    }
-    (patch, false)
-}
-
 #[tauri::command]
-pub async fn diff(root: String, name: String) -> Res<Diff> {
-    blocking(move || {
-        let r = repo(&root)?;
-        let files = r.diff_files(&name, &[])?;
-        let (patch, truncated) = cap_patch_lines(r.diff_patch(&name, &[])?, MAX_DIFF_LINES);
-        Ok(Diff {
-            files,
-            patch,
-            truncated,
-        })
-    })
-    .await
+pub async fn diff(root: String, name: String) -> Res<DiffBundle> {
+    blocking(move || repo(&root)?.diff_bundle(&name, &[], Some(MAX_DIFF_LINES))).await
 }
 
 /// The end of the last `exec --log` output, or nothing.
@@ -403,20 +370,5 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&other);
-    }
-
-    #[test]
-    fn patch_line_cap() {
-        let (out, trunc) = cap_patch_lines("a\nb\nc\n".to_string(), 3);
-        assert_eq!(out, "a\nb\nc\n");
-        assert!(!trunc);
-
-        let (out, trunc) = cap_patch_lines("a\nb\nc\nd\n".to_string(), 2);
-        assert_eq!(out, "a\nb\n");
-        assert!(trunc);
-
-        let (out, trunc) = cap_patch_lines("a\nb\nc".to_string(), 2);
-        assert_eq!(out, "a\nb\n");
-        assert!(trunc);
     }
 }
