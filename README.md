@@ -167,7 +167,7 @@ prunes. A menu-bar icon counts the agents running and a notification says when
 one finishes or fails. It uses the agent-ws library directly, so it shows
 exactly what the CLI shows.
 
-Build it from a clone (Node 20+ and the [Tauri prerequisites](https://tauri.app/start/prerequisites/)):
+Build it from a clone (Node 24+ and the [Tauri prerequisites](https://tauri.app/start/prerequisites/)):
 
 ```sh
 cd desktop
@@ -323,8 +323,12 @@ two runs of `bench/bench.sh`, each value the median of 3 tries.
 | Disk per workspace | full copy | 13 – 15 MB real (820 MB logical) |
 
 The install used a warm pnpm store, `--offline` and `--ignore-scripts`, the
-best case for `git worktree`. Reproduce on a throwaway APFS copy of your
-repository:
+best case for `git worktree`. On Linux (Btrfs/XFS), fresh clones use per-file
+`FICLONE` ioctls instead of macOS's single-syscall directory `clonefile(2)`, so
+fresh spawn times scale with file count while pooled spawns remain ~40 ms.
+`agent-ws drop` returns after an atomic rename into `.trash` and deletes in
+the background (use `bench/bench.sh` to see both async rename and full settle
+times). Reproduce on a throwaway APFS/Btrfs/XFS copy of your repository:
 
 ```sh
 cp -c -R my-repo /tmp/my-repo-copy

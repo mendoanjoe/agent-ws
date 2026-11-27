@@ -195,22 +195,29 @@ file, key order included.
 
 ## Safety
 
-- Writes in a workspace never change the source checkout (copy-on-write).
+- Writes to cloned files in a workspace never change the source checkout
+  (copy-on-write). However, external symlinks (`symlinks_external`) are allowed
+  with a warning unless `strict_symlinks = true` is configured, and `exec` and
+  hooks receive `AGENT_WS_REPO` in their environment.
 - Absolute symlinks into the source are retargeted into the workspace.
   Relative symlinks that climb out of the repository are rewritten to the
   absolute path they meant in the source. Both kinds of links that leave the
   workspace are reported, and fail the spawn with `strict_symlinks`.
-- Records are plain JSON files, so nothing trusts them: a record whose path is
-  not exactly `<home>/<repo>/ws/<name>` is corrupt and is never renamed,
-  deleted or used for git commands; `gc` forgets it without touching the
-  path. Every removal goes through one function that checks this.
-- `land` always adds a commit carrying the message and the `Agent-Ws`
-  trailers (empty if the agent already committed everything). It refuses an
-  existing branch unless the branch is already at the workspace's HEAD (an
-  interrupted land) or was landed earlier by the same workspace (`--keep`),
-  which then moves forward. The branch name is checked before anything is
-  committed, and `spawn` refuses names that cannot be part of the branch
-  `agent-ws/NAME` (`..`, a trailing `.` or `.lock`). Changed files count
+- Records are plain JSON files, so nothing trusts them: `Repo::owns` verifies
+  any workspace path is strictly `<home>/<repo>/ws/<name>` (and named records
+  bind to `<name>`), so a corrupt record is never renamed, deleted or used for
+  git commands; `gc` forgets it without touching the path. Every workspace-tree
+  removal goes through `Repo::discard`, while internal housekeeping
+  (`sweep_trash`, `sweep_leftovers`, and `runs/`/`tmp/` file cleanup) operates
+  only inside `<home>/<repo>/.trash`, `runs/`, and `tmp/`.
+- `land` adds a commit carrying the message and the `Agent-Ws` trailers (empty
+  if the agent already committed everything), except when resuming an
+  interrupted `land` or retrying `land --pr` at the already-landed commit. It
+  refuses an existing branch unless the branch is already at the workspace's
+  HEAD (an interrupted land) or was landed earlier by the same workspace
+  (`--keep`), which then moves forward. The branch name is checked before
+  anything is committed, and `spawn` refuses names that cannot be part of the
+  branch `agent-ws/NAME` (`..`, a trailing `.` or `.lock`). Changed files count
   every path touched: a rename is two, so deleting a file another workspace
   edits is an overlap. A workspace Git cannot read is left out of `land`'s
   overlap check instead of failing it. A workspace on its own branch

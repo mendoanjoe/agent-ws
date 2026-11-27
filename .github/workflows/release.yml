@@ -11,7 +11,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -27,19 +27,24 @@ jobs:
           - { target: x86_64-unknown-linux-musl, os: ubuntu-latest }
           - { target: aarch64-unknown-linux-musl, os: ubuntu-24.04-arm }
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
         with:
           targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - if: runner.os == 'Linux'
         run: sudo apt-get update -qq && sudo apt-get install -y -qq musl-tools
-      - run: cargo build --release --locked --target ${{ matrix.target }}
+      - env:
+          TARGET: ${{ matrix.target }}
+        run: cargo build --release --locked --target "$TARGET"
       - name: Package
+        env:
+          TARGET: ${{ matrix.target }}
         run: |
-          f=agent-ws-${{ matrix.target }}.tar.gz
-          tar -C target/${{ matrix.target }}/release -czf "$f" agent-ws
+          f="agent-ws-${TARGET}.tar.gz"
+          tar -C "target/${TARGET}/release" -czf "$f" agent-ws
           if command -v sha256sum >/dev/null; then sha256sum "$f" > "$f.sha256"; else shasum -a 256 "$f" > "$f.sha256"; fi
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: agent-ws-${{ matrix.target }}
           path: agent-ws-${{ matrix.target }}.tar.gz*
@@ -48,9 +53,13 @@ jobs:
     needs: build
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/download-artifact@v8
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           path: dist
           merge-multiple: true
@@ -61,6 +70,10 @@ jobs:
             /^## \[/ { if (on) exit; on = index($0, "[" v "]") > 0; next }
             on' CHANGELOG.md > notes.md
           test -s notes.md || { echo "No CHANGELOG.md section for $version"; exit 1; }
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
+        with:
+          subject-path: dist/*
       - name: Create or update release
         env:
           GH_TOKEN: ${{ github.token }}

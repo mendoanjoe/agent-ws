@@ -9,11 +9,13 @@ on:
     tags: ["desktop-v*"]
   # A change to this workflow builds once in its pull request.
   pull_request:
-    paths: [".github/workflows/release-desktop.yml"]
+    paths:
+      - ".github/workflows/release-desktop.yml"
+      - ".github/actions/setup-desktop/**"
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -28,40 +30,39 @@ jobs:
         include:
           - os: macos-latest
             targets: aarch64-apple-darwin,x86_64-apple-darwin
-            args: --target universal-apple-darwin --bundles dmg
+            target_flag: --target universal-apple-darwin
+            bundles: dmg
             files: target/universal-apple-darwin/release/bundle/dmg/*.dmg
           - os: ubuntu-latest
             targets: ""
-            args: --bundles appimage,deb
+            target_flag: ""
+            bundles: appimage,deb
             files: target/release/bundle/appimage/*.AppImage target/release/bundle/deb/*.deb
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-node@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: ./.github/actions/setup-desktop
         with:
-          node-version: 24
-          cache: npm
-          cache-dependency-path: desktop/package-lock.json
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.targets }}
-      - if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libxdo-dev
+          rust-targets: ${{ matrix.targets }}
       - name: Build
         working-directory: desktop
         env:
           # linuxdeploy is itself an AppImage; runners have no FUSE.
           APPIMAGE_EXTRACT_AND_RUN: 1
+          TARGET_FLAG: ${{ matrix.target_flag }}
+          BUNDLES: ${{ matrix.bundles }}
         run: |
-          npm ci
-          npx tauri build ${{ matrix.args }}
+          # shellcheck disable=SC2086
+          npx tauri build $TARGET_FLAG --bundles "$BUNDLES" -- --locked
       - name: Collect
+        env:
+          FILES: ${{ matrix.files }}
         run: |
-          mkdir dist
-          cp ${{ matrix.files }} dist/
+          mkdir -p dist
+          for pat in $FILES; do
+            cp "$pat" dist/
+          done
           cd dist && for f in *; do shasum -a 256 "$f" > "$f.sha256"; done && ls -la
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: desktop-${{ matrix.os }}
           path: dist/*
@@ -70,11 +71,19 @@ jobs:
     needs: build
     if: startsWith(github.ref, 'refs/tags/desktop-v')
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
     steps:
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           path: dist
           merge-multiple: true
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
+        with:
+          subject-path: dist/*
       - name: Create or update release
         env:
           GH_TOKEN: ${{ github.token }}

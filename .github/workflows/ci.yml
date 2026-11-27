@@ -6,6 +6,9 @@ on:
   pull_request:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -13,22 +16,31 @@ jobs:
   test:
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
         with:
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - run: cargo fmt --check
-      - run: cargo clippy --all-targets -- -D warnings
-      - run: cargo test
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      - run: cargo test --locked
 
   msrv:
-    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.88
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo check --all-targets
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@5445741acf05630efa19e221cc588ebe0842b13d # 1.88
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libxdo-dev
+      - run: cargo check --all-targets --locked
+      - run: cargo check -p agent-ws-desktop --locked
 
   # Linux needs reflinks: the tests run on a loop-mounted XFS or Btrfs
   # volume (the runner's own disk is ext4, which has none).
@@ -40,25 +52,34 @@ jobs:
       matrix:
         fs: [xfs, btrfs]
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
         with:
           components: clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - name: Mount ${{ matrix.fs }}
+        env:
+          FS: ${{ matrix.fs }}
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq xfsprogs btrfs-progs
-          truncate -s 4G "$RUNNER_TEMP/cow.img"
-          case "${{ matrix.fs }}" in
-            xfs) mkfs.xfs -q -m reflink=1 "$RUNNER_TEMP/cow.img" ;;
-            btrfs) mkfs.btrfs -q "$RUNNER_TEMP/cow.img" ;;
+          case "$FS" in
+            xfs)
+              sudo apt-get install -y -qq xfsprogs
+              truncate -s 4G "$RUNNER_TEMP/cow.img"
+              mkfs.xfs -q -m reflink=1 "$RUNNER_TEMP/cow.img"
+              ;;
+            btrfs)
+              sudo apt-get install -y -qq btrfs-progs
+              truncate -s 4G "$RUNNER_TEMP/cow.img"
+              mkfs.btrfs -q "$RUNNER_TEMP/cow.img"
+              ;;
           esac
           sudo mkdir /mnt/cow
           sudo mount -o loop "$RUNNER_TEMP/cow.img" /mnt/cow
           sudo chown "$USER" /mnt/cow
           git --version
-      - run: cargo clippy --all-targets -- -D warnings
-      - run: cargo test
+      - if: matrix.fs == 'xfs'
+        run: cargo clippy --all-targets --locked -- -D warnings
+      - run: cargo test --locked
         env:
           TMPDIR: /mnt/cow

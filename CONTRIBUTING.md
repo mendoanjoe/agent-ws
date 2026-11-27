@@ -28,11 +28,11 @@ records, the pool and the safety rules the code relies on.
 
 ```sh
 cargo fmt
-cargo clippy --all-targets -- -D warnings
-cargo test
+cargo clippy --all-targets --locked -- -D warnings
+cargo test --locked
 ```
 
-All three must pass. Run `cargo test` a few times when you touch anything
+All three must pass (using `--locked` to stay aligned with `Cargo.lock`). Run `cargo test --locked` a few times when you touch anything
 concurrent; flaky tests are bugs.
 
 They cover the CLI and the library only. When you change the desktop app,
@@ -40,8 +40,10 @@ also run, in `desktop/`:
 
 ```sh
 cargo fmt --all
+npx tsc --noEmit
 npm run build                                          # type-check and bundle the window
-cargo clippy -p agent-ws-desktop --all-targets -- -D warnings
+cargo clippy -p agent-ws-desktop --all-targets --locked -- -D warnings
+cargo test -p agent-ws-desktop --locked
 npm run tauri dev                                      # and try it
 ```
 
@@ -94,17 +96,29 @@ very good reason in the PR description.
 
 ## Releasing
 
+### CLI (`vX.Y.Z`)
+
 1. Move the `[Unreleased]` entries in `CHANGELOG.md` under a new
    `## [X.Y.Z] - YYYY-MM-DD` heading and update the links at the bottom.
-2. Set `version` in `Cargo.toml`, run `cargo build`, and commit as
+2. Set `version` in `Cargo.toml`, run `cargo build --locked`, and commit as
    `chore: release vX.Y.Z`.
 3. `git tag -a vX.Y.Z -m "agent-ws vX.Y.Z" && git push origin master vX.Y.Z`.
-   The Release workflow builds the macOS and Linux binaries and creates the
-   GitHub release from the changelog section.
+   The Release workflow builds the macOS and Linux binaries, attests build
+   provenance, and creates the GitHub release from the changelog section.
 4. `cargo publish`.
 5. In `mendoanjoe/homebrew-tap`, update `Formula/agent-ws.rb` with the new
    version and the sha256 values of the two macOS archives from the
    release's `.sha256` files.
+
+### Desktop (`desktop-vX.Y.Z`)
+
+1. Set the new version in `desktop/package.json`,
+   `desktop/src-tauri/Cargo.toml`, and `desktop/src-tauri/tauri.conf.json`,
+   update `Cargo.lock` (`cargo check -p agent-ws-desktop`), and commit.
+2. `git tag -a desktop-vX.Y.Z -m "agent-ws desktop vX.Y.Z" && git push origin master desktop-vX.Y.Z`.
+   The *Release desktop* workflow builds the universal macOS `.dmg` and Linux
+   AppImage/`.deb`, attests build provenance, and publishes the release
+   (with `--latest=false` so the CLI release remains latest).
 
 ## Ideas that need help
 

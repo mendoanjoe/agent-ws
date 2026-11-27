@@ -1,0 +1,34 @@
+name: Setup desktop build environment
+description: Install Node.js, Rust toolchain, Rust cache, Linux Tauri deps, and npm dependencies.
+
+inputs:
+  rust-components:
+    description: Optional comma-separated rustup components to install
+    required: false
+    default: ""
+  rust-targets:
+    description: Optional comma-separated Rust compilation targets
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+      with:
+        node-version: 24
+        cache: npm
+        cache-dependency-path: desktop/package-lock.json
+    - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+      with:
+        components: ${{ inputs.rust-components }}
+        targets: ${{ inputs.rust-targets }}
+    - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+    - if: runner.os == 'Linux'
+      shell: bash
+      run: |
+        sudo apt-get update -qq
+        sudo apt-get install -y -qq libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libxdo-dev
+    - shell: bash
+      working-directory: desktop
+      run: npm ci

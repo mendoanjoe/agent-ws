@@ -107,6 +107,96 @@ impl Env {
     }
 }
 
+fn path_of(v: &serde_json::Value) -> PathBuf {
+    PathBuf::from(v["path"].as_str().unwrap())
+}
+
+fn home_dir(e: &Env) -> PathBuf {
+    e.home
+        .read_dir()
+        .unwrap()
+        .flatten()
+        .find(|d| d.path().is_dir())
+        .unwrap()
+        .path()
+}
+
+/// The agent-ws binary with this test's home, extra environment, and no
+/// background work.
+fn bin(e: &Env, env: &[(&str, &str)]) -> Command {
+    let mut c = cmd(env!("CARGO_BIN_EXE_agent-ws"), &e.repo);
+    c.env("AGENT_WS_HOME", &e.home)
+        .env("AGENT_WS_NO_REFILL", "1")
+        .env("AGENT_WS_NO_AUTO_PRUNE", "1")
+        .envs(env.iter().copied());
+    c
+}
+
+/// Spawn and reap a short-lived process to obtain a guaranteed-dead PID.
+fn dead_pid() -> u32 {
+    let mut child = Command::new("true").spawn().unwrap();
+    let pid = child.id();
+    let _ = child.wait().unwrap();
+    pid
+}
+
+fn mutate_meta(dir: &Path, name: &str, f: impl FnOnce(&mut serde_json::Value)) {
+    let p = dir.join("meta").join(format!("{name}.json"));
+    let mut m: serde_json::Value = serde_json::from_slice(&fs::read(&p).unwrap()).unwrap();
+    f(&mut m);
+    fs::write(p, serde_json::to_vec(&m).unwrap()).unwrap();
+}
+
+fn list_names(e: &Env) -> Vec<String> {
+    e.ok(&["list"])
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["name"].as_str().unwrap().to_string())
+        .collect()
+}
+
+fn names(v: &serde_json::Value, key: &str) -> Vec<String> {
+    let mut out: Vec<String> = v[key]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|w| w["name"].as_str().unwrap().to_string())
+        .collect();
+    out.sort();
+    out
+}
+
+/// A directory with a stand-in `gh` that logs its arguments to `gh.log`
+/// next to it and answers `pr create` (or `pr list` when `FAKE_GH_HEAD` is set);
+/// PATH with it first.
+fn fake_gh(e: &Env) -> (PathBuf, String) {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = e.home.parent().unwrap().join("fake-gh");
+    fs::create_dir_all(&dir).unwrap();
+    let log = dir.join("gh.log");
+    fs::write(
+        dir.join("gh"),
+        "#!/bin/sh\n\
+         log=\"${FAKE_GH_LOG:-$(dirname \"$0\")/gh.log}\"\n\
+         printf '%s|' \"$@\" >> \"$log\"\necho >> \"$log\"\n\
+         case \"$1 $2\" in\n  \
+           'pr create') echo https://github.com/o/r/pull/7 ;;\n  \
+           'pr list')\n    \
+             if [ -n \"${FAKE_GH_HEAD:-}\" ]; then\n      \
+               case \"$*\" in\n        \
+                 *'--head agent-ws/kept'*) printf '[{\"headRefOid\":\"%s\"}]' \"$FAKE_GH_HEAD\" ;;\n        \
+                 *) printf '[]' ;;\n      \
+               esac\n    \
+             fi\n    ;;\n\
+         esac\n",
+    )
+    .unwrap();
+    fs::set_permissions(dir.join("gh"), fs::Permissions::from_mode(0o755)).unwrap();
+    let path = format!("{}:{}", dir.display(), std::env::var("PATH").unwrap());
+    (log, path)
+}
+
 #[test]
 fn spawn_gives_base_commit_plus_ignored_files() {
     let e = Env::new();
@@ -115,7 +205,7 @@ fn spawn_gives_base_commit_plus_ignored_files() {
     fs::write(e.repo.join("scratch.txt"), "untracked\n").unwrap();
 
     let s = e.ok(&["spawn", "w1"]);
-    let ws = PathBuf::from(s["path"].as_str().unwrap());
+    let ws = path_of(&s);
     assert_eq!(fs::read_to_string(ws.join("a.txt")).unwrap(), "one\n");
     assert!(!ws.join("scratch.txt").exists());
     assert!(
@@ -153,7 +243,7 @@ fn spawn_gives_base_commit_plus_ignored_files() {
 #[test]
 fn workspace_writes_do_not_touch_source() {
     let e = Env::new();
-    let ws = PathBuf::from(e.ok(&["spawn", "w1"])["path"].as_str().unwrap());
+    let ws = path_of(&e.ok(&["spawn", "w1"]));
     fs::write(ws.join("b.txt"), "changed\n").unwrap();
     fs::write(ws.join("node_modules/dep/index.js"), "patched\n").unwrap();
     fs::write(ws.join("dist/built.js"), "x").unwrap();
@@ -168,8 +258,8 @@ fn workspace_writes_do_not_touch_source() {
 #[test]
 fn status_reports_changes_and_overlaps() {
     let e = Env::new();
-    let w1 = PathBuf::from(e.ok(&["spawn", "w1"])["path"].as_str().unwrap());
-    let w2 = PathBuf::from(e.ok(&["spawn", "w2"])["path"].as_str().unwrap());
+    let w1 = path_of(&e.ok(&["spawn", "w1"]));
+    let w2 = path_of(&e.ok(&["spawn", "w2"]));
     fs::write(w1.join("a.txt"), "w1\n").unwrap();
     fs::write(w1.join("new.txt"), "n\n").unwrap();
     fs::write(w2.join("a.txt"), "w2\n").unwrap();
@@ -195,7 +285,7 @@ fn status_reports_changes_and_overlaps() {
 #[test]
 fn land_commits_to_branch_and_drops() {
     let e = Env::new();
-    let ws = PathBuf::from(e.ok(&["spawn", "w1"])["path"].as_str().unwrap());
+    let ws = path_of(&e.ok(&["spawn", "w1"]));
     fs::write(ws.join("a.txt"), "landed\n").unwrap();
     fs::write(ws.join("c.txt"), "new\n").unwrap();
     let l = e.ok(&["land", "w1", "-m", "feat: from agent"]);
@@ -220,7 +310,7 @@ fn land_refuses_existing_branch_and_empty_workspace() {
     e.ok(&["spawn", "w1"]);
     assert!(e.err(&["land", "w1", "-m", "x"]).contains("no changes"));
     git(&e.repo, &["branch", "agent-ws/w1"]);
-    let ws = PathBuf::from(e.ok(&["spawn", "w2"])["path"].as_str().unwrap());
+    let ws = path_of(&e.ok(&["spawn", "w2"]));
     fs::write(ws.join("a.txt"), "x\n").unwrap();
     assert!(
         e.err(&["land", "w2", "-m", "x", "--branch", "agent-ws/w1"])
@@ -232,7 +322,7 @@ fn land_refuses_existing_branch_and_empty_workspace() {
 #[test]
 fn drop_and_name_rules() {
     let e = Env::new();
-    let ws = PathBuf::from(e.ok(&["spawn", "w1"])["path"].as_str().unwrap());
+    let ws = path_of(&e.ok(&["spawn", "w1"]));
     assert!(e.err(&["spawn", "w1"]).contains("already exists"));
     assert!(e.err(&["spawn", "../x"]).contains("invalid workspace name"));
     assert!(
@@ -249,7 +339,7 @@ fn drop_and_name_rules() {
 #[test]
 fn works_from_inside_a_workspace() {
     let e = Env::new();
-    let ws = PathBuf::from(e.ok(&["spawn", "w1"])["path"].as_str().unwrap());
+    let ws = path_of(&e.ok(&["spawn", "w1"]));
     let out = cmd(env!("CARGO_BIN_EXE_agent-ws"), &ws)
         .env("AGENT_WS_HOME", &e.home)
         .args(["--json", "list"])
@@ -288,7 +378,7 @@ fn parallel_spawns_all_succeed() {
             s.spawn(move || {
                 let name = format!("p{i}");
                 if i % 2 == 0 {
-                    let ws = PathBuf::from(e.ok(&["path", &name])["path"].as_str().unwrap());
+                    let ws = path_of(&e.ok(&["path", &name]));
                     fs::write(ws.join(format!("f{i}.txt")), "x").unwrap();
                     e.ok(&["land", &name, "-m", "x"]);
                 } else {
@@ -327,23 +417,22 @@ fn same_name_race_has_one_winner() {
 #[test]
 fn gc_cleans_crashes_but_not_live_spawns() {
     let e = Env::new();
-    let keep = PathBuf::from(e.ok(&["spawn", "keep"])["path"].as_str().unwrap());
-    let dir = keep.parent().unwrap().parent().unwrap().to_path_buf();
+    let keep = path_of(&e.ok(&["spawn", "keep"]));
+    let dir = home_dir(&e);
     let set_meta = |name: &str, state: &str, pid: u32| {
-        let p = dir.join("meta").join(format!("{name}.json"));
-        let mut m: serde_json::Value = serde_json::from_slice(&fs::read(&p).unwrap()).unwrap();
-        m["state"] = state.into();
-        m["pid"] = pid.into();
-        fs::write(p, serde_json::to_vec(&m).unwrap()).unwrap();
+        mutate_meta(&dir, name, |m| {
+            m["state"] = state.into();
+            m["pid"] = pid.into();
+        });
     };
     // Spawn that died midway: record says creating, process is gone.
-    let crashed = PathBuf::from(e.ok(&["spawn", "crashed"])["path"].as_str().unwrap());
-    set_meta("crashed", "creating", 999_999);
+    let crashed = path_of(&e.ok(&["spawn", "crashed"]));
+    set_meta("crashed", "creating", dead_pid());
     // Spawn still running in another process (this test process is alive).
-    let live = PathBuf::from(e.ok(&["spawn", "live"])["path"].as_str().unwrap());
+    let live = path_of(&e.ok(&["spawn", "live"]));
     set_meta("live", "creating", std::process::id());
     // Folder deleted by hand.
-    let gone = PathBuf::from(e.ok(&["spawn", "gone"])["path"].as_str().unwrap());
+    let gone = path_of(&e.ok(&["spawn", "gone"]));
     fs::remove_dir_all(&gone).unwrap();
     // Folder with no record, and a leftover in the trash.
     fs::create_dir(dir.join("ws/orphan")).unwrap();
@@ -375,14 +464,7 @@ fn gc_cleans_crashes_but_not_live_spawns() {
         live.exists() && keep.exists(),
         "live spawn and ready workspace survive"
     );
-    let names: Vec<String> = e
-        .ok(&["list"])
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|m| m["name"].as_str().unwrap().to_string())
-        .collect();
-    assert_eq!(names, ["keep"]);
+    assert_eq!(list_names(&e), ["keep"]);
     let wt = git(&e.repo, &["worktree", "list"]);
     assert!(
         wt.contains("keep")
@@ -395,10 +477,6 @@ fn gc_cleans_crashes_but_not_live_spawns() {
     e.ok(&["spawn", "gone"]);
     let again = e.ok(&["gc"]);
     assert_eq!(again["interrupted"], serde_json::json!([]));
-}
-
-fn path_of(v: &serde_json::Value) -> PathBuf {
-    PathBuf::from(v["path"].as_str().unwrap())
 }
 
 #[test]
@@ -623,24 +701,15 @@ fn land_reports_overlaps_with_other_workspaces() {
 fn gc_recovers_dead_pool_claims() {
     let e = Env::new();
     e.ok(&["pool", "fill", "--size", "1"]);
-    let pool = fs::read_dir(
-        e.home
-            .read_dir()
-            .unwrap()
-            .flatten()
-            .find(|d| d.path().is_dir())
-            .unwrap()
-            .path()
-            .join("pool"),
-    )
-    .unwrap()
-    .flatten()
-    .map(|d| d.path())
-    .find(|p| p.extension().is_some_and(|x| x == "json"))
-    .unwrap();
+    let pool = fs::read_dir(home_dir(&e).join("pool"))
+        .unwrap()
+        .flatten()
+        .map(|d| d.path())
+        .find(|p| p.extension().is_some_and(|x| x == "json"))
+        .unwrap();
     let ws = path_of(&serde_json::from_slice(&fs::read(&pool).unwrap()).unwrap());
     // A spawn that died right after taking the record.
-    fs::rename(&pool, pool.with_extension("claim-999999")).unwrap();
+    fs::rename(&pool, pool.with_extension(format!("claim-{}", dead_pid()))).unwrap();
     let g = e.ok(&["gc"]);
     assert_eq!(g["claims"], 1);
     assert!(!ws.exists());
@@ -648,16 +717,6 @@ fn gc_recovers_dead_pool_claims() {
 }
 
 // ---- Fixes for the 2026-10-15 review (REPORT-glm.md F0-F7) ----
-
-fn home_dir(e: &Env) -> PathBuf {
-    e.home
-        .read_dir()
-        .unwrap()
-        .flatten()
-        .find(|d| d.path().is_dir())
-        .unwrap()
-        .path()
-}
 
 fn forge(dir: &Path, sub: &str, name: &str, path: &Path, state: &str, base: &str) {
     let m = serde_json::json!({
@@ -688,14 +747,7 @@ fn f0_records_pointing_outside_the_workspace_folder_are_never_followed() {
         e.repo.join("a.txt").exists() && e.repo.join(".git").exists(),
         "source untouched"
     );
-    let names: Vec<String> = e
-        .ok(&["list"])
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|m| m["name"].as_str().unwrap().into())
-        .collect();
-    assert_eq!(names, ["w1"], "corrupt records are not listed");
+    assert_eq!(list_names(&e), ["w1"], "corrupt records are not listed");
     e.ok(&["status"]);
 
     let g = e.ok(&["gc"]);
@@ -711,13 +763,12 @@ fn f0_records_pointing_outside_the_workspace_folder_are_never_followed() {
 fn f1_gc_is_not_fooled_by_a_reused_pid() {
     let e = Env::new();
     let ws = path_of(&e.ok(&["spawn", "reused"]));
-    let p = home_dir(&e).join("meta/reused.json");
-    let mut m: serde_json::Value = serde_json::from_slice(&fs::read(&p).unwrap()).unwrap();
     // A live process (this test) whose start time differs from the spawner's.
-    m["state"] = "creating".into();
-    m["pid"] = std::process::id().into();
-    m["pid_start"] = 1.into();
-    fs::write(&p, serde_json::to_vec(&m).unwrap()).unwrap();
+    mutate_meta(&home_dir(&e), "reused", |m| {
+        m["state"] = "creating".into();
+        m["pid"] = std::process::id().into();
+        m["pid_start"] = 1.into();
+    });
     assert_eq!(e.ok(&["gc"])["interrupted"], serde_json::json!(["reused"]));
     assert!(!ws.exists());
 }
@@ -751,10 +802,7 @@ fn f2_land_resumes_after_a_crash_between_branch_and_drop() {
 fn f4_corrupt_short_base_does_not_crash_the_cli() {
     let e = Env::new();
     e.ok(&["spawn", "w1"]);
-    let p = home_dir(&e).join("meta/w1.json");
-    let mut m: serde_json::Value = serde_json::from_slice(&fs::read(&p).unwrap()).unwrap();
-    m["base"] = "x".into();
-    fs::write(&p, serde_json::to_vec(&m).unwrap()).unwrap();
+    mutate_meta(&home_dir(&e), "w1", |m| m["base"] = "x".into());
     let out = e.run(&["list"]);
     assert!(
         out.status.success(),
@@ -937,17 +985,6 @@ fn n3_untracked_unignored_secrets_are_reported_and_keepable() {
     );
 }
 
-fn names(v: &serde_json::Value, key: &str) -> Vec<String> {
-    let mut out: Vec<String> = v[key]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|w| w["name"].as_str().unwrap().to_string())
-        .collect();
-    out.sort();
-    out
-}
-
 #[test]
 fn p1_prune_drops_only_clean_merged_workspaces() {
     let e = Env::new();
@@ -1018,14 +1055,7 @@ fn p1_prune_drops_only_clean_merged_workspaces() {
     agent.kill().unwrap();
     agent.wait().unwrap();
     assert!(!merged.exists() && !squashed.exists());
-    let left: Vec<String> = e
-        .ok(&["list"])
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|m| m["name"].as_str().unwrap().to_string())
-        .collect();
-    assert_eq!(left, ["ahead", "busy", "dirty"]);
+    assert_eq!(list_names(&e), ["ahead", "busy", "dirty"]);
     // The agent left: the busy workspace is now an unused one.
     let again = e.ok(&args);
     assert_eq!(names(&again, "pruned"), ["busy"]);
@@ -1045,8 +1075,19 @@ fn p2_du_reports_real_unshared_bytes() {
 
     {
         use std::io::Write;
+        // Incompressible bytes so transparent filesystem compression (e.g. Btrfs)
+        // still allocates >= 2 MiB of private extents.
+        let mut x: u32 = 0x1234_5678;
+        let data: Vec<u8> = (0..(2 << 20))
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 17;
+                x ^= x << 5;
+                (x >> 24) as u8
+            })
+            .collect();
         let mut f = fs::File::create(ws.join("big.bin")).unwrap();
-        f.write_all(&vec![1u8; 2 << 20]).unwrap();
+        f.write_all(&data).unwrap();
         f.sync_all().unwrap();
     }
     let du = e.ok(&["du", "w"]);
@@ -1148,12 +1189,7 @@ fn p4_gc_registers_orphans_that_hold_work_instead_of_deleting_them() {
 #[test]
 fn p5_spawn_prunes_merged_workspaces_in_the_background() {
     let e = Env::new();
-    let age = |name: &str| {
-        let p = home_dir(&e).join(format!("meta/{name}.json"));
-        let mut m: serde_json::Value = serde_json::from_slice(&fs::read(&p).unwrap()).unwrap();
-        m["created"] = 0.into();
-        fs::write(p, serde_json::to_vec(&m).unwrap()).unwrap();
-    };
+    let age = |name: &str| mutate_meta(&home_dir(&e), name, |m| m["created"] = 0.into());
     let merged = path_of(&e.ok(&["spawn", "merged"]));
     fs::write(merged.join("c.txt"), "see\n").unwrap();
     git(&merged, &["add", "-A"]);
@@ -1308,7 +1344,6 @@ fn r3_names_and_branches_git_rejects_fail_before_any_commit() {
 
 #[test]
 fn r4_prune_gh_asks_about_the_branch_land_keep_created() {
-    use std::os::unix::fs::PermissionsExt;
     let e = Env::new();
     let ws = path_of(&e.ok(&["spawn", "kept"]));
     fs::write(ws.join("c.txt"), "see\n").unwrap();
@@ -1316,24 +1351,9 @@ fn r4_prune_gh_asks_about_the_branch_land_keep_created() {
     let head = landed["commit"].as_str().unwrap().to_string();
     // main has not fetched the merge: only GitHub knows the PR was merged.
     // A stand-in `gh` reports a merged PR from agent-ws/kept at `head`.
-    let bin = e.home.parent().unwrap().join("fake-bin");
-    fs::create_dir(&bin).unwrap();
-    fs::write(
-        bin.join("gh"),
-        "#!/bin/sh\ncase \"$*\" in\n\
-         *'--head agent-ws/kept'*) printf '[{\"headRefOid\":\"%s\"}]' \"$FAKE_GH_HEAD\" ;;\n\
-         *) printf '[]' ;;\nesac\n",
-    )
-    .unwrap();
-    fs::set_permissions(bin.join("gh"), fs::Permissions::from_mode(0o755)).unwrap();
-    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+    let (_log, path) = fake_gh(&e);
     let prune = |extra: &[&str]| -> serde_json::Value {
-        let out = cmd(env!("CARGO_BIN_EXE_agent-ws"), &e.repo)
-            .env("AGENT_WS_HOME", &e.home)
-            .env("AGENT_WS_NO_REFILL", "1")
-            .env("AGENT_WS_NO_AUTO_PRUNE", "1")
-            .env("PATH", &path)
-            .env("FAKE_GH_HEAD", &head)
+        let out = bin(&e, &[("PATH", &path), ("FAKE_GH_HEAD", &head)])
             .args(["--json", "prune", "--base", "main", "--min-age-min", "0"])
             .args(extra)
             .output()
@@ -1374,7 +1394,7 @@ fn r6_worktree_registry_changes_take_turns() {
     // uses it: lands and drops in parallel failed after doing their work.
     // Hold the lock another agent-ws process would hold: drop must wait.
     let e = Env::new();
-    e.ok(&["spawn", "w"]);
+    let ws = path_of(&e.ok(&["spawn", "w"]));
     let lock = fs::OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -1382,14 +1402,21 @@ fn r6_worktree_registry_changes_take_turns() {
         .open(home_dir(&e).join("worktrees.lock"))
         .unwrap();
     assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) }, 0);
-    let mut child = cmd(env!("CARGO_BIN_EXE_agent-ws"), &e.repo)
-        .env("AGENT_WS_HOME", &e.home)
-        .env("AGENT_WS_NO_REFILL", "1")
-        .env("AGENT_WS_NO_AUTO_PRUNE", "1")
-        .args(["drop", "w"])
-        .spawn()
-        .unwrap();
-    std::thread::sleep(std::time::Duration::from_millis(500));
+    let mut child = bin(&e, &[]).args(["drop", "w"]).spawn().unwrap();
+    // `drop` renames `ws/w` into `.trash` right before calling `worktree prune`
+    // (which waits on `worktrees.lock`), so polling `!ws.exists()` proves the
+    // child actually started and reached the lock.
+    for _ in 0..200 {
+        if !ws.exists() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(
+        !ws.exists(),
+        "drop moved workspace before locking worktrees"
+    );
+    std::thread::sleep(std::time::Duration::from_millis(100));
     let early = child.try_wait().unwrap();
     drop(lock);
     let status = child.wait().unwrap();
@@ -1469,39 +1496,6 @@ fn s2_status_tells_conflicts_from_overlaps_that_merge_cleanly() {
     let before = count();
     e.ok(&["status"]);
     assert_eq!(count(), before);
-}
-
-/// The agent-ws binary with this test's home, extra environment, and no
-/// background work.
-fn bin(e: &Env, env: &[(&str, &str)]) -> Command {
-    let mut c = cmd(env!("CARGO_BIN_EXE_agent-ws"), &e.repo);
-    c.env("AGENT_WS_HOME", &e.home)
-        .env("AGENT_WS_NO_REFILL", "1")
-        .env("AGENT_WS_NO_AUTO_PRUNE", "1")
-        .envs(env.iter().copied());
-    c
-}
-
-/// A directory with a stand-in `gh` that logs its arguments to `gh.log`
-/// next to it and answers `pr create` with a URL; PATH with it first.
-fn fake_gh(e: &Env) -> (PathBuf, String) {
-    use std::os::unix::fs::PermissionsExt;
-    let dir = e.home.parent().unwrap().join("fake-gh");
-    fs::create_dir_all(&dir).unwrap();
-    let log = dir.join("gh.log");
-    fs::write(
-        dir.join("gh"),
-        format!(
-            "#!/bin/sh\nprintf '%s|' \"$@\" >> '{}'\necho >> '{}'\n\
-             case \"$1 $2\" in\n  'pr create') echo https://github.com/o/r/pull/7 ;;\nesac\n",
-            log.display(),
-            log.display()
-        ),
-    )
-    .unwrap();
-    fs::set_permissions(dir.join("gh"), fs::Permissions::from_mode(0o755)).unwrap();
-    let path = format!("{}:{}", dir.display(), std::env::var("PATH").unwrap());
-    (log, path)
 }
 
 #[test]
@@ -1878,10 +1872,7 @@ fn s8_claude_install_keeps_the_rest_of_the_settings() {
 fn s9_prune_cleans_up_claude_worktrees_and_merged_branches() {
     let e = Env::new();
     let set_created = |name: &str, created: u64| {
-        let p = home_dir(&e).join(format!("meta/{name}.json"));
-        let mut m: serde_json::Value = serde_json::from_slice(&fs::read(&p).unwrap()).unwrap();
-        m["created"] = created.into();
-        fs::write(p, serde_json::to_vec(&m).unwrap()).unwrap();
+        mutate_meta(&home_dir(&e), name, |m| m["created"] = created.into());
     };
     let age = |name: &str| set_created(name, 0);
     e.ok(&["spawn", "idle"]);

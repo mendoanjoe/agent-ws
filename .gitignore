@@ -1,5 +1,8 @@
 /target
 .boost/
+.boostgraph/
+.claude/settings.local.json
+.sv.json
 /desktop/node_modules
 /desktop/dist
 /desktop/src-tauri/gen
