@@ -38,23 +38,30 @@ pub fn clone_path(src: &Path, dst: &Path) -> Result<()> {
 /// (ext4): only Btrfs and XFS (with reflink=1, the default) have them.
 #[cfg(target_os = "linux")]
 pub fn clone_path(src: &Path, dst: &Path) -> Result<()> {
-    let md = std::fs::symlink_metadata(src).with_context(|| format!("stat {}", src.display()))?;
-    let ft = md.file_type();
-    if ft.is_symlink() {
-        std::os::unix::fs::symlink(std::fs::read_link(src)?, dst)
-            .with_context(|| format!("symlink {}", dst.display()))?;
-    } else if ft.is_dir() {
-        std::fs::create_dir(dst).with_context(|| format!("mkdir {}", dst.display()))?;
-        for entry in std::fs::read_dir(src)? {
-            let entry = entry?;
-            clone_path(&entry.path(), &dst.join(entry.file_name()))?;
+    let mut stack = vec![(src.to_path_buf(), dst.to_path_buf())];
+    let mut dirs: Vec<(PathBuf, std::fs::Metadata)> = Vec::new();
+    while let Some((s, d)) = stack.pop() {
+        let md = std::fs::symlink_metadata(&s).with_context(|| format!("stat {}", s.display()))?;
+        let ft = md.file_type();
+        if ft.is_symlink() {
+            std::os::unix::fs::symlink(std::fs::read_link(&s)?, &d)
+                .with_context(|| format!("symlink {}", d.display()))?;
+        } else if ft.is_dir() {
+            std::fs::create_dir(&d).with_context(|| format!("mkdir {}", d.display()))?;
+            for entry in std::fs::read_dir(&s)? {
+                let entry = entry?;
+                stack.push((entry.path(), d.join(entry.file_name())));
+            }
+            dirs.push((d, md));
+        } else if ft.is_file() {
+            reflink(&s, &d, &md)?;
         }
-        // After the children: a read-only folder could not take them, and
-        // creating them changed its mtime.
-        std::fs::set_permissions(dst, md.permissions())?;
-        let _ = keep_times(dst, &md);
-    } else if ft.is_file() {
-        reflink(src, dst, &md)?;
+    }
+    // After the children: a read-only folder could not take them, and
+    // creating them changed its mtime. Apply deepest-first.
+    for (d, md) in dirs.into_iter().rev() {
+        let _ = keep_times(&d, &md);
+        std::fs::set_permissions(&d, md.permissions())?;
     }
     Ok(())
 }
@@ -62,10 +69,12 @@ pub fn clone_path(src: &Path, dst: &Path) -> Result<()> {
 #[cfg(target_os = "linux")]
 fn reflink(src: &Path, dst: &Path, md: &std::fs::Metadata) -> Result<()> {
     use std::os::fd::AsRawFd;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     let from = std::fs::File::open(src).with_context(|| format!("open {}", src.display()))?;
     let to = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
+        .mode(md.permissions().mode())
         .open(dst)
         .with_context(|| format!("create {}", dst.display()))?;
     if unsafe { libc::ioctl(to.as_raw_fd(), libc::FICLONE as _, from.as_raw_fd()) } != 0 {
@@ -83,23 +92,43 @@ fn reflink(src: &Path, dst: &Path, md: &std::fs::Metadata) -> Result<()> {
     Ok(())
 }
 
-#[cfg(target_os = "linux")]
 fn times(md: &std::fs::Metadata) -> Result<std::fs::FileTimes> {
     Ok(std::fs::FileTimes::new()
         .set_accessed(md.accessed()?)
         .set_modified(md.modified()?))
 }
 
-#[cfg(target_os = "linux")]
 fn keep_times(dir: &Path, md: &std::fs::Metadata) -> Result<()> {
     std::fs::File::open(dir)?.set_times(times(md)?)?;
     Ok(())
+}
+
+fn normalize_excludes(excludes: &[PathBuf]) -> Vec<PathBuf> {
+    excludes
+        .iter()
+        .filter_map(|e| normalize(e))
+        .filter(|e| !e.as_os_str().is_empty())
+        .collect()
 }
 
 /// Clone the children of `src` into the existing directory `dst`, skipping
 /// `excludes` (paths relative to the root). A directory that only contains an
 /// excluded path is recreated and its other children cloned one by one.
 pub fn clone_tree(
+    src_root: &Path,
+    dst_root: &Path,
+    rel: &Path,
+    excludes: &[PathBuf],
+) -> Result<usize> {
+    if rel.as_os_str().is_empty() {
+        let norm = normalize_excludes(excludes);
+        clone_tree_norm(src_root, dst_root, rel, &norm)
+    } else {
+        clone_tree_norm(src_root, dst_root, rel, excludes)
+    }
+}
+
+fn clone_tree_norm(
     src_root: &Path,
     dst_root: &Path,
     rel: &Path,
@@ -116,10 +145,13 @@ pub fn clone_tree(
         let ft = entry.file_type()?;
         let has_nested_exclude = excludes.iter().any(|e| e.starts_with(&r) && e != &r);
         if ft.is_dir() && has_nested_exclude {
-            let meta = entry.metadata()?;
-            std::fs::create_dir(dst_root.join(&r))?;
-            std::fs::set_permissions(dst_root.join(&r), meta.permissions())?;
-            calls += clone_tree(src_root, dst_root, &r, excludes)?;
+            let entry_path = entry.path();
+            let meta = std::fs::symlink_metadata(&entry_path)?;
+            let dst_dir = dst_root.join(&r);
+            std::fs::create_dir(&dst_dir)?;
+            calls += clone_tree_norm(src_root, dst_root, &r, excludes)?;
+            let _ = keep_times(&dst_dir, &meta);
+            std::fs::set_permissions(&dst_dir, meta.permissions())?;
         } else {
             clone_path(&entry.path(), &dst_root.join(&r))?;
             calls += 1;
@@ -139,7 +171,7 @@ pub fn free_bytes(path: &Path) -> Result<u64> {
             std::io::Error::last_os_error()
         );
     }
-    Ok(s.f_bavail as u64 * s.f_frsize as u64)
+    Ok((s.f_bavail as u64).saturating_mul(s.f_frsize as u64))
 }
 
 /// Device id, to make sure source and workspaces share one APFS volume.
@@ -160,7 +192,7 @@ pub struct Scan {
     pub secrets: Vec<String>,
 }
 
-/// Remove `.`/`..` lexically. `None` when `..` climbs above the start.
+/// Remove `.`/`..` lexically for relative paths. `None` when `..` climbs above the start.
 fn normalize(p: &Path) -> Option<PathBuf> {
     let mut out = PathBuf::new();
     for c in p.components() {
@@ -177,55 +209,173 @@ fn normalize(p: &Path) -> Option<PathBuf> {
     Some(out)
 }
 
+/// Remove `.`/`..` lexically for absolute paths without popping `/`.
+/// `None` if `..` climbs above `/` or the path is not absolute.
+fn normalize_abs(p: &Path) -> Option<PathBuf> {
+    if !p.is_absolute() {
+        return None;
+    }
+    let mut out = PathBuf::new();
+    for c in p.components() {
+        match c {
+            std::path::Component::RootDir => out.push(c),
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                if out.as_os_str() == "/" || !out.pop() {
+                    return None;
+                }
+            }
+            c => out.push(c),
+        }
+    }
+    Some(out)
+}
+
+fn is_base64_pem_line(line: &[u8]) -> bool {
+    if line.is_empty() {
+        return false;
+    }
+    let mut pad = 0u8;
+    for &b in line {
+        if b == b'=' {
+            pad += 1;
+            if pad > 2 {
+                return false;
+            }
+        } else if pad > 0 || !(b.is_ascii_alphanumeric() || b == b'+' || b == b'/') {
+            return false;
+        }
+    }
+    true
+}
+
+fn is_cert_metadata_line(raw_line: &[u8], trimmed: &[u8]) -> bool {
+    if trimmed == b"Bag Attributes"
+        || trimmed.starts_with(b"subject=")
+        || trimmed.starts_with(b"issuer=")
+    {
+        return true;
+    }
+    // Indented OpenSSL bag attribute lines such as `    friendlyName: ...`.
+    raw_line.starts_with(b" ") && trimmed.contains(&b':') && !trimmed.contains(&b'=')
+}
+
 /// Whether `path` is a regular file holding only PEM certificates (or
 /// CRLs), comments allowed. Certificates are public: CA bundles such as
 /// certifi's `cacert.pem` match `*.pem` by name, yet pip and requests fail
 /// every HTTPS call without them. Keys, binary or unreadable files, and
 /// anything mentioning a private key are not.
 pub fn only_certificates(path: &Path) -> bool {
+    use std::io::{BufRead, BufReader, Read};
     const LIMIT: u64 = 16 << 20;
+    const MAX_LINE: usize = 64 * 1024;
     let Ok(md) = std::fs::symlink_metadata(path) else {
         return false;
     };
     if !md.is_file() || md.len() > LIMIT {
         return false;
     }
-    let Ok(raw) = std::fs::read(path) else {
+    let Ok(file) = std::fs::File::open(path) else {
         return false;
     };
-    if raw.windows(11).any(|w| w == b"PRIVATE KEY") {
-        return false;
-    }
-    let mut blocks = 0;
-    for line in raw.split(|&b| b == b'\n') {
-        let Some(label) = line
-            .trim_ascii()
-            .strip_prefix(b"-----BEGIN ")
-            .and_then(|l| l.strip_suffix(b"-----"))
-        else {
-            continue;
-        };
-        if !matches!(label, b"CERTIFICATE" | b"TRUSTED CERTIFICATE" | b"X509 CRL") {
+    let mut reader = BufReader::with_capacity(8192, file.take(LIMIT));
+    let mut raw_line = Vec::with_capacity(128);
+    let mut in_block: Option<&'static [u8]> = None;
+    let mut saw_b64 = false;
+    let mut blocks = 0usize;
+
+    loop {
+        raw_line.clear();
+        loop {
+            let avail = match reader.fill_buf() {
+                Ok(b) => b,
+                Err(_) => return false,
+            };
+            if avail.is_empty() {
+                break;
+            }
+            if let Some(pos) = avail.iter().position(|&b| b == b'\n') {
+                if raw_line.len() + pos > MAX_LINE {
+                    return false;
+                }
+                raw_line.extend_from_slice(&avail[..pos]);
+                reader.consume(pos + 1);
+                break;
+            }
+            if raw_line.len() + avail.len() > MAX_LINE {
+                return false;
+            }
+            raw_line.extend_from_slice(avail);
+            let n = avail.len();
+            reader.consume(n);
+            if reader.fill_buf().map(|b| b.is_empty()).unwrap_or(true) {
+                break;
+            }
+        }
+        if raw_line.is_empty() && reader.fill_buf().map(|b| b.is_empty()).unwrap_or(true) {
+            break;
+        }
+        if raw_line
+            .iter()
+            .any(|&b| b == 0 || (b < 0x20 && b != b'\t' && b != b'\r'))
+        {
             return false;
         }
-        blocks += 1;
+        if raw_line.windows(11).any(|w| w == b"PRIVATE KEY") {
+            return false;
+        }
+        let trimmed = raw_line.trim_ascii();
+        if let Some(expected) = in_block {
+            if let Some(label) = trimmed
+                .strip_prefix(b"-----END ")
+                .and_then(|l| l.strip_suffix(b"-----"))
+            {
+                if label != expected || !saw_b64 {
+                    return false;
+                }
+                in_block = None;
+                blocks += 1;
+            } else if is_base64_pem_line(trimmed) {
+                saw_b64 = true;
+            } else {
+                return false;
+            }
+        } else if trimmed.is_empty() || trimmed.starts_with(b"#") {
+            continue;
+        } else if let Some(label) = trimmed
+            .strip_prefix(b"-----BEGIN ")
+            .and_then(|l| l.strip_suffix(b"-----"))
+        {
+            in_block = match label {
+                b"CERTIFICATE" => Some(b"CERTIFICATE"),
+                b"TRUSTED CERTIFICATE" => Some(b"TRUSTED CERTIFICATE"),
+                b"X509 CRL" => Some(b"X509 CRL"),
+                _ => return false,
+            };
+            saw_b64 = false;
+        } else if !is_cert_metadata_line(&raw_line, trimmed) {
+            return false;
+        }
     }
-    blocks > 0
+    in_block.is_none() && blocks > 0
 }
 
 /// Walk the workspace once (skipping every `.git` file or folder):
+/// - untracked files and symlinks whose name matches `is_secret` are deleted
+///   (regular files holding only certificates are spared);
 /// - absolute symlinks into `src_root` are retargeted into `dst_root`;
-/// - relative symlinks that climb out of the root are rewritten to the
-///   absolute path they meant in the source, and reported as external;
-/// - other absolute symlinks are reported as external;
-/// - untracked files whose name matches `is_secret` are deleted, unless
-///   they hold only certificates.
+/// - relative symlinks that climb out of the root are retargeted into
+///   `dst_root` if they resolve back into `src_root`, or rewritten to the
+///   absolute path they meant in the source and reported as external;
+/// - other absolute symlinks are reported as external.
 pub fn scan(
     src_root: &Path,
     dst_root: &Path,
     tracked: &std::collections::HashSet<String>,
     is_secret: &dyn Fn(&str) -> bool,
 ) -> Result<Scan> {
+    let norm_src = normalize_abs(src_root);
+    let src_cmp = norm_src.as_deref().unwrap_or(src_root);
     let mut found = Scan::default();
     let mut stack = vec![PathBuf::new()];
     while let Some(rel_dir) = stack.pop() {
@@ -243,16 +393,37 @@ pub fn scan(
             if ft.is_dir() {
                 stack.push(rel);
             } else if ft.is_symlink() {
+                if is_secret(&name.to_string_lossy()) && !tracked.contains(&*rel.to_string_lossy())
+                {
+                    std::fs::remove_file(&p)?;
+                    found.secrets.push(rel.to_string_lossy().into_owned());
+                    continue;
+                }
                 let target = std::fs::read_link(&p)?;
-                if let Ok(rest) = target.strip_prefix(src_root) {
-                    relink(&p, &dst_root.join(rest))?;
-                    found.retargeted.push(rel);
-                } else if target.is_absolute() {
-                    found.external.push((rel, target));
+                if target.is_absolute() {
+                    if let Some(norm_t) = normalize_abs(&target)
+                        && let Ok(rest) = norm_t.strip_prefix(src_cmp)
+                        && let Some(clean_rest) = normalize(rest)
+                    {
+                        relink(&p, &dst_root.join(&clean_rest))?;
+                        found.retargeted.push(rel);
+                    } else {
+                        found.external.push((rel, target));
+                    }
                 } else if normalize(&rel_dir.join(&target)).is_none() {
-                    let meant = normalize(&src_root.join(&rel_dir).join(&target)).unwrap_or(target);
-                    relink(&p, &meant)?;
-                    found.external.push((rel, meant));
+                    if let Some(meant) = normalize_abs(&src_cmp.join(&rel_dir).join(&target)) {
+                        if let Ok(rest) = meant.strip_prefix(src_cmp)
+                            && let Some(clean_rest) = normalize(rest)
+                        {
+                            relink(&p, &dst_root.join(&clean_rest))?;
+                            found.retargeted.push(rel);
+                        } else {
+                            relink(&p, &meant)?;
+                            found.external.push((rel, meant));
+                        }
+                    } else {
+                        found.external.push((rel, target));
+                    }
                 }
             } else if is_secret(&name.to_string_lossy())
                 && !tracked.contains(&*rel.to_string_lossy())
@@ -329,8 +500,6 @@ pub fn private_size(path: &Path) -> Option<u64> {
     }
     // _IOWR('f', 11, struct fiemap), the header being 32 bytes.
     const FS_IOC_FIEMAP: libc::c_ulong = 0xC020_660B;
-    // Flush first, so data not yet written out has extents to count.
-    const FIEMAP_FLAG_SYNC: u32 = 0x1;
     const FIEMAP_EXTENT_LAST: u32 = 0x1;
     const FIEMAP_EXTENT_SHARED: u32 = 0x2000;
 
@@ -341,7 +510,7 @@ pub fn private_size(path: &Path) -> Option<u64> {
         let mut map: Fiemap = unsafe { std::mem::zeroed() };
         map.start = start;
         map.length = u64::MAX - start;
-        map.flags = FIEMAP_FLAG_SYNC;
+        map.flags = 0;
         map.count = 64;
         if unsafe { libc::ioctl(file.as_raw_fd(), FS_IOC_FIEMAP as _, &raw mut map) } != 0 {
             return None;
@@ -356,7 +525,13 @@ pub fn private_size(path: &Path) -> Option<u64> {
             if e.flags & FIEMAP_EXTENT_LAST != 0 {
                 return Some(private);
             }
-            start = e.logical + e.length;
+            let Some(next) = e.logical.checked_add(e.length) else {
+                return Some(private);
+            };
+            if e.length == 0 || next <= start {
+                return Some(private);
+            }
+            start = next;
         }
     }
 }
@@ -382,28 +557,30 @@ impl std::ops::AddAssign for Usage {
     }
 }
 
-/// Walk `root` without following symlinks and add up its files.
-pub fn usage(root: &Path) -> Usage {
-    usage_by(root, 0).0
-}
-
-/// Like `usage`, plus the usage per path `depth` levels below `root`
-/// (`depth` 1 = top-level entries), for finding what grows.
-pub fn usage_by(root: &Path, depth: usize) -> (Usage, Vec<(PathBuf, Usage)>) {
+fn walk_usage(root: &Path, track_rel: bool, mut on_file: impl FnMut(&Path, Usage)) -> Usage {
     use std::os::unix::fs::MetadataExt;
     let mut total = Usage::default();
-    let mut parts: std::collections::BTreeMap<PathBuf, Usage> = Default::default();
     let mut stack = vec![PathBuf::new()];
     while let Some(rel_dir) = stack.pop() {
+        let dir = if track_rel {
+            root.join(&rel_dir)
+        } else if rel_dir.as_os_str().is_empty() {
+            root.to_path_buf()
+        } else {
+            rel_dir.clone()
+        };
         // Folders can vanish mid-walk (a build or a delete running).
-        let Ok(rd) = std::fs::read_dir(root.join(&rel_dir)) else {
+        let Ok(rd) = std::fs::read_dir(&dir) else {
             continue;
         };
         for entry in rd.flatten() {
-            let rel = rel_dir.join(entry.file_name());
             let Ok(ft) = entry.file_type() else { continue };
             if ft.is_dir() {
-                stack.push(rel);
+                if track_rel {
+                    stack.push(rel_dir.join(entry.file_name()));
+                } else {
+                    stack.push(entry.path());
+                }
                 continue;
             }
             if !ft.is_file() {
@@ -411,19 +588,44 @@ pub fn usage_by(root: &Path, depth: usize) -> (Usage, Vec<(PathBuf, Usage)>) {
             }
             let Ok(md) = entry.metadata() else { continue };
             let p = entry.path();
+            let allocated = md.blocks().saturating_mul(512);
+            let private = if md.blocks() == 0 {
+                0
+            } else {
+                private_size(&p).unwrap_or(allocated)
+            };
             let u = Usage {
                 files: 1,
                 logical: md.len(),
-                allocated: md.blocks() * 512,
-                private: private_size(&p).unwrap_or(md.blocks() * 512),
+                allocated,
+                private,
             };
             total += u;
-            if depth > 0 {
-                let key: PathBuf = rel.components().take(depth).collect();
-                *parts.entry(key).or_default() += u;
+            if track_rel {
+                let rel = rel_dir.join(entry.file_name());
+                on_file(&rel, u);
             }
         }
     }
+    total
+}
+
+/// Walk `root` without following symlinks and add up its files.
+pub fn usage(root: &Path) -> Usage {
+    walk_usage(root, false, |_, _| {})
+}
+
+/// Like `usage`, plus the usage per path `depth` levels below `root`
+/// (`depth` 1 = top-level entries), for finding what grows.
+pub fn usage_by(root: &Path, depth: usize) -> (Usage, Vec<(PathBuf, Usage)>) {
+    if depth == 0 {
+        return (usage(root), Vec::new());
+    }
+    let mut parts: std::collections::BTreeMap<PathBuf, Usage> = Default::default();
+    let total = walk_usage(root, true, |rel, u| {
+        let key: PathBuf = rel.components().take(depth).collect();
+        *parts.entry(key).or_default() += u;
+    });
     (total, parts.into_iter().collect())
 }
 
@@ -449,7 +651,11 @@ pub fn cwd_users(root: &Path) -> Vec<(u32, PathBuf)> {
 /// (canonical path), as (pid, cwd). Agents and shells sit in their workspace.
 #[cfg(target_os = "macos")]
 pub fn cwd_users(root: &Path) -> Vec<(u32, PathBuf)> {
-    let mut pids = vec![0 as libc::c_int; 8192];
+    let est = unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) };
+    if est <= 0 {
+        return Vec::new();
+    }
+    let mut pids = vec![0 as libc::c_int; (est as usize).max(1024).saturating_add(256)];
     let n = unsafe {
         libc::proc_listallpids(
             pids.as_mut_ptr().cast(),
@@ -457,7 +663,11 @@ pub fn cwd_users(root: &Path) -> Vec<(u32, PathBuf)> {
         )
     };
     let mut out = Vec::new();
-    for &pid in pids.iter().take(n.max(0) as usize) {
+    for &pid in pids
+        .iter()
+        .take((n.max(0) as usize).min(pids.len()))
+        .filter(|&&p| p > 0)
+    {
         let mut info: libc::proc_vnodepathinfo = unsafe { std::mem::zeroed() };
         let size = std::mem::size_of::<libc::proc_vnodepathinfo>() as libc::c_int;
         let got = unsafe {
@@ -474,8 +684,10 @@ pub fn cwd_users(root: &Path) -> Vec<(u32, PathBuf)> {
         }
         let raw = info.pvi_cdir.vip_path.as_flattened();
         let len = raw.iter().position(|&c| c == 0).unwrap_or(raw.len());
-        let bytes: Vec<u8> = raw[..len].iter().map(|&c| c as u8).collect();
-        let cwd = PathBuf::from(std::ffi::OsStr::from_bytes(&bytes));
+        // SAFETY: `raw` is a valid slice of `c_char` (same size/alignment as `u8`)
+        // for at least `len` elements.
+        let bytes = unsafe { std::slice::from_raw_parts(raw.as_ptr().cast::<u8>(), len) };
+        let cwd = PathBuf::from(std::ffi::OsStr::from_bytes(bytes));
         if cwd.starts_with(root) {
             out.push((pid as u32, cwd));
         }
@@ -484,8 +696,19 @@ pub fn cwd_users(root: &Path) -> Vec<(u32, PathBuf)> {
 }
 
 fn relink(link: &Path, target: &Path) -> Result<()> {
-    std::fs::remove_file(link)?;
-    std::os::unix::fs::symlink(target, link)?;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let parent = match link.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    let seq = NEXT.fetch_add(1, Ordering::Relaxed);
+    let tmp = parent.join(format!(".agent-ws-link-{}-{seq}", std::process::id()));
+    std::os::unix::fs::symlink(target, &tmp)?;
+    if let Err(e) = std::fs::rename(&tmp, link) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e.into());
+    }
     Ok(())
 }
 
@@ -611,5 +834,84 @@ mod tests {
         assert_eq!(normalize(Path::new("a/./b/..")), Some(PathBuf::from("a")));
         assert_eq!(normalize(Path::new("../x")), None);
         assert_eq!(normalize(Path::new("a/../../x")), None);
+        assert_eq!(
+            normalize_abs(Path::new("/a/b/../c")),
+            Some(PathBuf::from("/a/c"))
+        );
+        assert_eq!(normalize_abs(Path::new("/..")), None);
+    }
+
+    #[test]
+    fn only_certificates_rejects_mixed_secrets_and_unclosed_blocks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("mix.pem");
+        std::fs::write(
+            &p,
+            "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\nAPI_KEY=secret\n",
+        )
+        .unwrap();
+        assert!(!only_certificates(&p));
+
+        std::fs::write(&p, "-----BEGIN CERTIFICATE-----\nMIIB\n").unwrap();
+        assert!(!only_certificates(&p));
+
+        std::fs::write(
+            &p,
+            "Bag Attributes\n    friendlyName: Test\nsubject=CN=x\n-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n",
+        )
+        .unwrap();
+        assert!(only_certificates(&p));
+    }
+
+    #[test]
+    fn scan_blocks_traversal_retarget_and_secret_symlinks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("repo");
+        let dst = tmp.path().join("ws");
+        std::fs::create_dir_all(src.join("sub")).unwrap();
+        std::fs::create_dir_all(dst.join("sub")).unwrap();
+        std::fs::write(src.join("a.txt"), "ok").unwrap();
+        std::fs::write(dst.join("a.txt"), "ok").unwrap();
+        std::fs::write(tmp.path().join("outside"), "secret").unwrap();
+
+        // Absolute symlink with `..` attempting to escape src_root via prefix match.
+        std::os::unix::fs::symlink(src.join("sub/../../outside"), dst.join("abs_escape")).unwrap();
+        // Relative symlink climbing out of sub and back into src_root.
+        std::os::unix::fs::symlink("../../repo/a.txt", dst.join("sub/back_in")).unwrap();
+        // Secret symlink (must be deleted even though it is a symlink).
+        std::os::unix::fs::symlink(tmp.path().join("outside"), dst.join(".env")).unwrap();
+
+        let tracked = std::collections::HashSet::new();
+        let s = scan(&src, &dst, &tracked, &|n| n == ".env").unwrap();
+        assert_eq!(s.secrets, [".env"]);
+        assert!(!dst.join(".env").exists());
+        assert_eq!(s.retargeted, [PathBuf::from("sub/back_in")]);
+        assert_eq!(
+            std::fs::read_link(dst.join("sub/back_in")).unwrap(),
+            dst.join("a.txt")
+        );
+        assert_eq!(s.external.len(), 1);
+        assert_eq!(s.external[0].0, PathBuf::from("abs_escape"));
+    }
+
+    #[test]
+    fn clone_tree_handles_readonly_dir_with_nested_exclude() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        let dst = tmp.path().join("dst");
+        std::fs::create_dir_all(src.join("ro/skip")).unwrap();
+        std::fs::create_dir_all(&dst).unwrap();
+        std::fs::write(src.join("ro/keep.txt"), "k").unwrap();
+        std::fs::write(src.join("ro/skip/x.txt"), "x").unwrap();
+        std::fs::set_permissions(src.join("ro"), std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let calls = clone_tree(&src, &dst, Path::new(""), &[PathBuf::from("./ro/skip")]).unwrap();
+        // Restore write bit so tempdir cleanup succeeds cleanly.
+        let _ = std::fs::set_permissions(src.join("ro"), std::fs::Permissions::from_mode(0o755));
+        let _ = std::fs::set_permissions(dst.join("ro"), std::fs::Permissions::from_mode(0o755));
+        assert!(calls >= 1);
+        assert!(dst.join("ro/keep.txt").exists());
+        assert!(!dst.join("ro/skip").exists());
     }
 }

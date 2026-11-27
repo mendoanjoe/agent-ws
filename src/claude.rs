@@ -63,23 +63,66 @@ pub fn settings_path(root: Option<&Path>, scope: Scope) -> Result<PathBuf> {
 }
 
 fn read_settings(path: &Path) -> Result<Value> {
-    match std::fs::read(path) {
-        Ok(raw) if raw.iter().all(u8::is_ascii_whitespace) => Ok(json!({})),
-        Ok(raw) => serde_json::from_slice(&raw)
-            .with_context(|| format!("invalid JSON in {}", path.display())),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(json!({})),
-        Err(e) => Err(e.into()),
+    match std::fs::symlink_metadata(path) {
+        Ok(md) if md.file_type().is_symlink() => {
+            bail!("refusing to follow symlink at {}", path.display())
+        }
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(json!({})),
+        Err(e) => return Err(e.into()),
+    }
+    let raw = std::fs::read(path)?;
+    if raw.iter().all(u8::is_ascii_whitespace) {
+        Ok(json!({}))
+    } else {
+        serde_json::from_slice(&raw).with_context(|| format!("invalid JSON in {}", path.display()))
     }
 }
 
 fn write_settings(path: &Path, settings: &Value) -> Result<()> {
-    if let Some(dir) = path.parent() {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+
+    if let Some(dir) = path.parent()
+        && !dir.as_os_str().is_empty()
+    {
         std::fs::create_dir_all(dir)?;
     }
+    let existing_perms = match std::fs::symlink_metadata(path) {
+        Ok(md) if md.file_type().is_symlink() => {
+            bail!("refusing to overwrite symlink at {}", path.display())
+        }
+        Ok(md) => Some(md.permissions()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(e.into()),
+    };
     let mut raw = serde_json::to_string_pretty(settings)?;
     raw.push('\n');
-    std::fs::write(path, raw)?;
-    Ok(())
+    let parent = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    let seq = NEXT.fetch_add(1, Ordering::Relaxed);
+    let tmp = parent.join(format!(".settings.tmp-{}-{seq}", std::process::id()));
+    let write_res = (|| -> Result<()> {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)?;
+        if let Some(perms) = existing_perms {
+            f.set_permissions(perms)?;
+        }
+        f.write_all(raw.as_bytes())?;
+        f.sync_all()?;
+        drop(f);
+        std::fs::rename(&tmp, path)?;
+        Ok(())
+    })();
+    if write_res.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    write_res
 }
 
 fn is_ours(entry: &Value) -> bool {
@@ -131,9 +174,22 @@ pub fn uninstall(path: &Path) -> Result<bool> {
     let mut changed = false;
     for event in EVENTS {
         if let Some(list) = hooks.get_mut(event).and_then(Value::as_array_mut) {
-            let before = list.len();
-            list.retain(|e| !is_ours(e));
-            changed |= list.len() != before;
+            let mut keep_entries = Vec::with_capacity(list.len());
+            for mut entry in list.drain(..) {
+                let mut drop_entry = false;
+                if let Some(inner) = entry.get_mut("hooks").and_then(Value::as_array_mut) {
+                    let before = inner.len();
+                    inner.retain(|h| h["command"] != HOOK_COMMAND);
+                    if inner.len() != before {
+                        changed = true;
+                        drop_entry = inner.is_empty();
+                    }
+                }
+                if !drop_entry {
+                    keep_entries.push(entry);
+                }
+            }
+            *list = keep_entries;
             if list.is_empty() {
                 hooks.shift_remove(event);
             }
@@ -184,13 +240,17 @@ impl Repo {
             if self.meta_path(&name).exists() || self.branch_tip(&branch).is_some() {
                 continue;
             }
-            return self.spawn(&SpawnOpts {
+            match self.spawn(&SpawnOpts {
                 name,
                 use_pool: true,
                 branch: Some(branch),
                 origin: "claude".into(),
                 ..Default::default()
-            });
+            }) {
+                Ok(s) => return Ok(s),
+                Err(e) if i < 100 && e.to_string().contains("already exists") => continue,
+                Err(e) => return Err(e),
+            }
         }
         bail!("no free workspace name for {name:?}")
     }
@@ -198,18 +258,34 @@ impl Repo {
     /// WorktreeRemove: drop the workspace at `path`. Its branch stays if it
     /// has commits. A path that is not an agent-ws workspace is left alone.
     pub fn claude_remove(&self, path: &Path) -> Result<()> {
-        let real = std::fs::canonicalize(path).unwrap_or(path.to_path_buf());
-        let m = self
-            .list()?
-            .into_iter()
-            .find(|m| m.path == path || std::fs::canonicalize(&m.path).is_ok_and(|p| p == real))
-            .with_context(|| {
-                format!(
-                    "{} is not an agent-ws workspace; left it alone",
-                    path.display()
-                )
-            })?;
-        self.drop(&m.name)
+        let exists = match std::fs::symlink_metadata(path) {
+            Ok(md) if md.file_type().is_symlink() => {
+                bail!("refusing to remove symlink at {}", path.display())
+            }
+            Ok(_) => true,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+            Err(e) => return Err(e.into()),
+        };
+        let real = if exists {
+            std::fs::canonicalize(path).ok()
+        } else {
+            let parent = path.parent().and_then(|p| std::fs::canonicalize(p).ok());
+            parent.and_then(|p| path.file_name().map(|f| p.join(f)))
+        };
+        let found = self.list()?.into_iter().find(|m| {
+            m.path == path
+                || real.as_ref().is_some_and(|r| {
+                    m.path == *r || std::fs::canonicalize(&m.path).is_ok_and(|p| p == *r)
+                })
+        });
+        match found {
+            Some(m) => self.drop(&m.name),
+            None if !exists => Ok(()),
+            None => bail!(
+                "{} is not an agent-ws workspace; left it alone",
+                path.display()
+            ),
+        }
     }
 }
 
@@ -223,5 +299,45 @@ mod tests {
         assert_eq!(workspace_name("feat/login.lock"), "feat-login-lock");
         assert_eq!(workspace_name("a..b"), "a--b");
         assert_eq!(workspace_name("..."), "claude");
+    }
+
+    #[test]
+    fn uninstall_preserves_sibling_hooks_and_rejects_symlinks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let settings = tmp.path().join("settings.json");
+        std::fs::write(
+            &settings,
+            serde_json::to_string_pretty(&json!({
+                "hooks": {
+                    "WorktreeCreate": [
+                        { "hooks": [{ "type": "command", "command": "other-hook" }, { "type": "command", "command": HOOK_COMMAND }] }
+                    ],
+                    "WorktreeRemove": [
+                        { "hooks": [{ "type": "command", "command": HOOK_COMMAND }] }
+                    ]
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(uninstall(&settings).unwrap());
+        let v: Value = serde_json::from_slice(&std::fs::read(&settings).unwrap()).unwrap();
+        assert_eq!(
+            v["hooks"]["WorktreeCreate"][0]["hooks"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            v["hooks"]["WorktreeCreate"][0]["hooks"][0]["command"],
+            "other-hook"
+        );
+        assert!(v["hooks"].get("WorktreeRemove").is_none());
+
+        let link = tmp.path().join("link.json");
+        std::os::unix::fs::symlink(&settings, &link).unwrap();
+        assert!(install(&link).is_err());
+        assert!(uninstall(&link).is_err());
     }
 }

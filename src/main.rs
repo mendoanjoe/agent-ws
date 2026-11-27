@@ -225,8 +225,11 @@ fn short(id: &str) -> &str {
     id.get(..12).unwrap_or(id)
 }
 
-/// Bytes as `812 KB`, `14.2 MB`, `1.3 GB` (powers of 1000, like `df -H`).
+/// Bytes as `512 B`, `14.2 MB`, `1.3 GB` (powers of 1000, like `df -H`).
 fn human(b: u64) -> String {
+    if b < 1_000 {
+        return format!("{b} B");
+    }
     let b = b as f64;
     if b >= 1e9 {
         format!("{:.1} GB", b / 1e9)
@@ -267,20 +270,33 @@ fn main() {
     }
 }
 
+/// Spawn a detached `agent-ws` background subcommand in its own process group,
+/// reaping the child asynchronously so long-lived `exec --spawn` does not keep zombies.
+fn spawn_background(repo: &Repo, args: &[&str]) {
+    if let Ok(exe) = std::env::current_exe() {
+        use std::os::unix::process::CommandExt;
+        if let Ok(mut child) = std::process::Command::new(exe)
+            .args(args)
+            .current_dir(&repo.root)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .process_group(0)
+            .spawn()
+        {
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+        }
+    }
+}
+
 /// Top the pool up in a detached process so the caller does not wait.
 fn refill_in_background(repo: &Repo) {
     if repo.pool_target() == 0 || std::env::var_os("AGENT_WS_NO_REFILL").is_some() {
         return;
     }
-    if let Ok(exe) = std::env::current_exe() {
-        let _ = std::process::Command::new(exe)
-            .args(["pool", "fill"])
-            .current_dir(&repo.root)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn();
-    }
+    spawn_background(repo, &["pool", "fill"]);
 }
 
 /// Drop merged workspaces in a detached process, at most every 10 minutes,
@@ -289,17 +305,7 @@ fn prune_in_background(repo: &Repo) {
     if std::env::var_os("AGENT_WS_NO_AUTO_PRUNE").is_some() || !repo.auto_prune_due() {
         return;
     }
-    if let Ok(exe) = std::env::current_exe() {
-        use std::os::unix::process::CommandExt;
-        let _ = std::process::Command::new(exe)
-            .args(["prune", "--merged-only"])
-            .current_dir(&repo.root)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .process_group(0)
-            .spawn();
-    }
+    spawn_background(repo, &["prune", "--merged-only"]);
 }
 
 /// Runs a command; returns the process exit code.
@@ -384,7 +390,7 @@ fn git_ignores(path: &std::path::Path) -> bool {
         && std::process::Command::new("git")
             .arg("-C")
             .arg(dir)
-            .args(["check-ignore", "-q"])
+            .args(["check-ignore", "-q", "--"])
             .arg(path)
             .status()
             .is_ok_and(|s| s.success())
@@ -393,8 +399,14 @@ fn git_ignores(path: &std::path::Path) -> bool {
 /// Claude Code's WorktreeCreate/WorktreeRemove hook. For WorktreeCreate,
 /// stdout holds the workspace path and nothing else.
 fn claude_hook() -> Result<i32> {
+    const MAX_HOOK_INPUT: u64 = 1 << 20;
     let mut raw = String::new();
-    std::io::stdin().read_to_string(&mut raw)?;
+    let n = std::io::stdin()
+        .take(MAX_HOOK_INPUT + 1)
+        .read_to_string(&mut raw)?;
+    if n as u64 > MAX_HOOK_INPUT {
+        bail!("hook input from Claude Code exceeds 1 MiB limit");
+    }
     let input: claude::HookInput =
         serde_json::from_str(&raw).context("read the hook input from Claude Code")?;
     match input.hook_event_name.as_str() {
@@ -417,11 +429,15 @@ fn claude_hook() -> Result<i32> {
             let path = input
                 .worktree_path
                 .context("WorktreeRemove input without worktree_path")?;
-            // Already gone counts as removed.
-            if path.symlink_metadata().is_err() {
-                return Ok(0);
+            let repo = match input.cwd.as_deref() {
+                Some(cwd) => Repo::discover(cwd).or_else(|_| Repo::discover(&path)),
+                None => Repo::discover(&path),
+            };
+            match repo {
+                Ok(repo) => repo.claude_remove(&path)?,
+                Err(_) if path.symlink_metadata().is_err() => return Ok(0),
+                Err(e) => return Err(e),
             }
-            Repo::discover(&path)?.claude_remove(&path)?;
             Ok(0)
         }
         other => {
@@ -448,7 +464,7 @@ fn repo_cmd(json: bool, repo: &Repo, cmd: Cmd) -> Result<i32> {
                 base,
                 exclude,
                 keep_secrets,
-                min_free_bytes: min_free_gb.map(|g| g * 1_000_000_000),
+                min_free_bytes: min_free_gb.map(|g| g.saturating_mul(1_000_000_000)),
                 use_pool: !no_pool,
                 carry,
                 branch,
@@ -601,16 +617,23 @@ fn repo_cmd(json: bool, repo: &Repo, cmd: Cmd) -> Result<i32> {
         }),
         Cmd::Diff { name, stat, paths } => {
             if json {
+                if stat {
+                    bail!("--stat cannot be used with --json");
+                }
                 return print(true, &repo.diff_files(&name, &paths)?, |_| {});
             }
             // Git pages and colours the patch as it does for `git diff`.
             let s = repo.snapshot(&name)?;
+            if s.base.starts_with('-') || s.tree.starts_with('-') {
+                bail!("invalid snapshot revision");
+            }
             let mut git = std::process::Command::new("git");
             git.arg("-C").arg(&s.path).arg("diff");
             if stat {
                 git.arg("--stat");
             }
             let status = git
+                .arg("--end-of-options")
                 .arg(&s.base)
                 .arg(&s.tree)
                 .arg("--")
@@ -727,7 +750,7 @@ fn repo_cmd(json: bool, repo: &Repo, cmd: Cmd) -> Result<i32> {
                 base,
                 dry_run,
                 gh,
-                min_age_secs: min_age_min * 60,
+                min_age_secs: min_age_min.saturating_mul(60),
                 merged_only,
             })?,
             |p| {
@@ -804,10 +827,14 @@ fn repo_cmd(json: bool, repo: &Repo, cmd: Cmd) -> Result<i32> {
                 );
             }),
             PoolCmd::Clear => print(json, &repo.pool_fill(Some(0))?, |f| {
-                println!(
-                    "removed {} pooled workspaces",
-                    f.removed_stale + f.removed_extra
-                );
+                if f.busy {
+                    println!("another fill is running");
+                } else {
+                    println!(
+                        "removed {} pooled workspaces",
+                        f.removed_stale + f.removed_extra
+                    );
+                }
             }),
         },
         Cmd::Trust => print(json, &repo.trust()?, |h| {

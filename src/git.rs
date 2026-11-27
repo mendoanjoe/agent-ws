@@ -4,18 +4,17 @@ use anyhow::{Context, Result, bail};
 use std::ffi::OsStr;
 use std::path::Path;
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 
-pub fn run(dir: &Path, args: &[&str]) -> Result<String> {
-    run_env(dir, args, &[])
-}
+static NEXT_TMP: AtomicU64 = AtomicU64::new(0);
 
-/// `run` with extra environment variables.
-pub fn run_env(dir: &Path, args: &[&str], env: &[(&str, &OsStr)]) -> Result<String> {
+fn run_raw(dir: &Path, args: &[&str], env: &[(&str, &OsStr)]) -> Result<Vec<u8>> {
     let out = Command::new("git")
         .arg("-C")
         .arg(dir)
         .args(args)
         .envs(env.iter().copied())
+        .env("GIT_TERMINAL_PROMPT", "0")
         .output()?;
     if !out.status.success() {
         bail!(
@@ -24,11 +23,33 @@ pub fn run_env(dir: &Path, args: &[&str], env: &[(&str, &OsStr)]) -> Result<Stri
             String::from_utf8_lossy(&out.stderr).trim()
         );
     }
-    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    Ok(out.stdout)
+}
+
+pub fn run(dir: &Path, args: &[&str]) -> Result<String> {
+    run_env(dir, args, &[])
+}
+
+pub fn run_bytes(dir: &Path, args: &[&str]) -> Result<Vec<u8>> {
+    run_raw(dir, args, &[])
+}
+
+/// `run` with extra environment variables.
+pub fn run_env(dir: &Path, args: &[&str], env: &[(&str, &OsStr)]) -> Result<String> {
+    let out = run_raw(dir, args, env)?;
+    Ok(String::from_utf8_lossy(&out).into_owned())
 }
 
 pub fn line(dir: &Path, args: &[&str]) -> Result<String> {
     Ok(run(dir, args)?.trim().to_string())
+}
+
+fn check_rev(rev: &str, label: &str) -> Result<()> {
+    if rev.is_empty() || rev.starts_with('-') || rev.bytes().any(|b| b == 0 || b.is_ascii_control())
+    {
+        bail!("invalid {label} {rev:?}");
+    }
+    Ok(())
 }
 
 /// Author, committer and a fixed date for commits made only to compare
@@ -50,23 +71,36 @@ const SNAPSHOT_ID: &[(&str, &str)] = &[
 pub fn snapshot_tree(dir: &Path, scratch: &Path) -> Result<String> {
     let index = line(
         dir,
-        &["rev-parse", "--path-format=absolute", "--git-path", "index"],
+        &[
+            "--no-optional-locks",
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-path",
+            "index",
+        ],
     )?;
     std::fs::create_dir_all(scratch)?;
-    let tmp = scratch.join(format!(
-        "index-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0)
-    ));
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let seq = NEXT_TMP.fetch_add(1, Ordering::Relaxed);
+    let tmp = scratch.join(format!("index-{}-{nanos}-{seq}", std::process::id()));
     // Starting from a copy keeps the cached file stats: only changed files
     // are read again. Git writes the index by rename, so the copy is whole.
-    match std::fs::copy(&index, &tmp) {
-        Ok(_) => {}
+    let index_path = Path::new(&index);
+    match std::fs::symlink_metadata(index_path) {
+        Ok(_) => {
+            if crate::fsutil::clone_path(index_path, &tmp).is_err() {
+                match std::fs::copy(index_path, &tmp) {
+                    Ok(_) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(e).with_context(|| format!("copy {index}")),
+                }
+            }
+        }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e).with_context(|| format!("copy {index}")),
+        Err(e) => return Err(e).with_context(|| format!("stat {index}")),
     }
     let env = [("GIT_INDEX_FILE", tmp.as_os_str())];
     let tree = run_env(dir, &["add", "-A"], &env).and_then(|_| run_env(dir, &["write-tree"], &env));
@@ -77,6 +111,8 @@ pub fn snapshot_tree(dir: &Path, scratch: &Path) -> Result<String> {
 /// A commit of `tree` on top of `parent`, to give `merge-tree` the history
 /// it needs to find the merge base. Not referenced by anything.
 pub fn snapshot_commit(dir: &Path, tree: &str, parent: &str) -> Result<String> {
+    check_rev(tree, "tree")?;
+    check_rev(parent, "parent")?;
     let env: Vec<(&str, &OsStr)> = SNAPSHOT_ID
         .iter()
         .map(|(k, v)| (*k, OsStr::new(v)))
@@ -94,6 +130,8 @@ pub fn snapshot_commit(dir: &Path, tree: &str, parent: &str) -> Result<String> {
 /// merge cleanly). `None` when this Git cannot tell: `merge-tree
 /// --write-tree` needs Git 2.38.
 pub fn merge_conflicts(dir: &Path, a: &str, b: &str) -> Result<Option<Vec<String>>> {
+    check_rev(a, "commit")?;
+    check_rev(b, "commit")?;
     let out = Command::new("git")
         .arg("-C")
         .arg(dir)
@@ -103,24 +141,39 @@ pub fn merge_conflicts(dir: &Path, a: &str, b: &str) -> Result<Option<Vec<String
             "--name-only",
             "--no-messages",
             "-z",
+            "--end-of-options",
             a,
             b,
         ])
+        .env("GIT_TERMINAL_PROMPT", "0")
         .output()?;
     match out.status.code() {
         // `<tree>\0<path>\0<path>\0…`: the merged tree, then conflicted paths.
         Some(0) | Some(1) => {
-            let mut paths: Vec<String> = String::from_utf8_lossy(&out.stdout)
-                .split('\0')
+            let mut paths: Vec<String> = out
+                .stdout
+                .split(|&b| b == 0)
                 .skip(1)
                 .filter(|p| !p.is_empty())
-                .map(String::from)
+                .map(|p| String::from_utf8_lossy(p).into_owned())
                 .collect();
             paths.sort();
             paths.dedup();
             Ok(Some(paths))
         }
-        _ => Ok(None),
+        code => {
+            let err = String::from_utf8_lossy(&out.stderr);
+            let low = err.to_ascii_lowercase();
+            if code == Some(129)
+                || low.contains("unknown option")
+                || low.contains("unrecognized option")
+                || low.contains("usage: git merge-tree")
+            {
+                Ok(None)
+            } else {
+                bail!("git merge-tree failed ({}): {}", out.status, err.trim());
+            }
+        }
     }
 }
 
@@ -131,8 +184,9 @@ pub fn merge_conflicts(dir: &Path, a: &str, b: &str) -> Result<Option<Vec<String
 /// Read-only: a coordinator polls this while agents commit, and a plain
 /// `git status` rewrites the index under `index.lock`, failing their commits.
 pub fn changed_paths(dir: &Path, base: &str) -> Result<Vec<String>> {
+    check_rev(base, "base")?;
     let mut paths = Vec::new();
-    let out = run(
+    let out = run_bytes(
         dir,
         &[
             "--no-optional-locks",
@@ -143,27 +197,50 @@ pub fn changed_paths(dir: &Path, base: &str) -> Result<Vec<String>> {
             "--no-renames",
         ],
     )?;
-    let mut parts = out.split('\0').filter(|s| !s.is_empty());
+    let mut parts = out.split(|&b| b == 0).filter(|s| !s.is_empty());
     while let Some(entry) = parts.next() {
         if entry.len() > 3 {
-            paths.push(entry[3..].to_string());
+            paths.push(String::from_utf8_lossy(&entry[3..]).into_owned());
         }
-        if entry.starts_with('R') || entry.starts_with('C') {
+        if entry.starts_with(b"R") || entry.starts_with(b"C") {
             parts.next();
         }
     }
     // Commits the agent made inside the workspace count as changes too.
-    for p in run(
+    for p in run_bytes(
         dir,
-        &["diff", "--name-only", "--no-renames", "-z", base, "HEAD"],
+        &[
+            "--no-optional-locks",
+            "diff",
+            "--name-only",
+            "--no-renames",
+            "-z",
+            "--end-of-options",
+            base,
+            "HEAD",
+            "--",
+        ],
     )?
-    .split('\0')
+    .split(|&b| b == 0)
     {
         if !p.is_empty() {
-            paths.push(p.to_string());
+            paths.push(String::from_utf8_lossy(p).into_owned());
         }
     }
     paths.sort();
     paths.dedup();
     Ok(paths)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn check_rev_rejects_option_like_strings() {
+        assert!(check_rev("--output=/tmp/x", "base").is_err());
+        assert!(check_rev("-p", "parent").is_err());
+        assert!(check_rev("", "tree").is_err());
+        assert!(check_rev("HEAD", "base").is_ok());
+    }
 }
