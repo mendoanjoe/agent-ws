@@ -2008,3 +2008,314 @@ fn d3_gc_keeps_the_runs_of_names_with_dots() {
             .is_none()
     );
 }
+
+// ---- Wave 2 regression tests (security, bugfixes, CLI flags & config) ----
+
+#[test]
+fn w2_submodule_gitdir_escape_and_symlink_are_rejected() {
+    let e = Env::new();
+    let inner = e.repo.parent().unwrap().join("inner");
+    fs::create_dir(&inner).unwrap();
+    git(&inner, &["init", "-q", "-b", "main"]);
+    fs::write(inner.join("i.txt"), "i\n").unwrap();
+    git(&inner, &["add", "-A"]);
+    git(&inner, &["commit", "-qm", "i"]);
+    git(
+        &e.repo,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            "-q",
+            inner.to_str().unwrap(),
+            "sm",
+        ],
+    );
+    git(&e.repo, &["commit", "-qm", "add sm"]);
+
+    // Case 1: `gitdir:` pointing outside `.git/modules`.
+    let evil = e.repo.parent().unwrap().join("evil-gitdir");
+    fs::create_dir(&evil).unwrap();
+    fs::write(e.repo.join("sm/.git"), "gitdir: ../../evil-gitdir\n").unwrap();
+    let err = e.err(&["spawn", "sm-escape"]);
+    assert!(err.contains("outside .git/modules"), "{err}");
+    assert!(list_names(&e).is_empty());
+
+    // Case 2: symlinked `.git` inside submodule.
+    fs::remove_file(e.repo.join("sm/.git")).unwrap();
+    std::os::unix::fs::symlink(e.repo.join(".git/modules/sm"), e.repo.join("sm/.git")).unwrap();
+    let err = e.err(&["spawn", "sm-sym"]);
+    assert!(err.contains("cannot be a symlink"), "{err}");
+    assert!(list_names(&e).is_empty());
+}
+
+#[test]
+fn w2_gitignored_env_symlink_and_mixed_cert_pem_are_stripped() {
+    let e = Env::new();
+    fs::write(
+        e.repo.join(".gitignore"),
+        "node_modules/\n.env\n.env.*\n!.env.example\ndist\nout/\next\n*.pem\n",
+    )
+    .unwrap();
+    git(&e.repo, &["commit", "-qam", "ignore pem"]);
+    // Replace `.env` with a symlink; it must still be removed as a secret.
+    fs::remove_file(e.repo.join(".env")).unwrap();
+    std::os::unix::fs::symlink(e.repo.join("a.txt"), e.repo.join(".env")).unwrap();
+
+    // Mixed file (valid cert header + secret key/env content) must be stripped,
+    // while a valid certificate-only PEM stays.
+    let cert = "-----BEGIN CERTIFICATE-----\nMIIBszCCAVmgAwIBAgIU\n-----END CERTIFICATE-----\n";
+    fs::write(e.repo.join("valid.pem"), cert).unwrap();
+    fs::write(
+        e.repo.join("mixed.pem"),
+        format!("{cert}API_KEY=supersecret\n"),
+    )
+    .unwrap();
+
+    let s = e.ok(&["spawn", "w"]);
+    let ws = path_of(&s);
+    assert_eq!(
+        s["secrets_removed"],
+        serde_json::json!([".env", "mixed.pem"])
+    );
+    assert!(ws.join(".env").symlink_metadata().is_err());
+    assert!(!ws.join("mixed.pem").exists());
+    assert!(ws.join("valid.pem").exists());
+    assert!(e.repo.join(".env").symlink_metadata().is_ok());
+}
+
+#[test]
+fn w2_strict_symlinks_catches_unnormalized_escape_and_retargets_returning_link() {
+    let e = Env::new();
+    fs::write(
+        e.repo.join(".gitignore"),
+        "node_modules/\n.env\ndist\nout/\next\nescape\nsub/\n",
+    )
+    .unwrap();
+    git(&e.repo, &["commit", "-qam", "ignore test links"]);
+    let outside = e.repo.parent().unwrap().join("outside-target");
+    fs::create_dir(&outside).unwrap();
+
+    // Remove `ext` so only the unnormalized `<src_root>/sub/../../outside-target`
+    // symlink exists, proving it triggers `strict_symlinks` on its own.
+    fs::remove_file(e.repo.join("ext")).unwrap();
+
+    // Absolute path starting with `<src_root>` that climbs out via `..`.
+    let escaped = e.repo.join("sub/../..").join("outside-target");
+    std::os::unix::fs::symlink(&escaped, e.repo.join("escape")).unwrap();
+
+    fs::write(e.repo.join(".agent-ws.toml"), "strict_symlinks = true\n").unwrap();
+    let err = e.err(&["spawn", "strict"]);
+    assert!(err.contains("strict_symlinks"), "{err}");
+    assert!(err.contains("escape"), "{err}");
+
+    // Remove the escaping link; test a relative link that climbs out and back in.
+    fs::remove_file(e.repo.join("escape")).unwrap();
+    fs::create_dir(e.repo.join("sub")).unwrap();
+    let repo_name = e.repo.file_name().unwrap().to_str().unwrap();
+    std::os::unix::fs::symlink(
+        format!("../../{repo_name}/a.txt"),
+        e.repo.join("sub/roundtrip"),
+    )
+    .unwrap();
+    let s = e.ok(&["spawn", "ret"]);
+    let ws = path_of(&s);
+    assert_eq!(
+        fs::read_link(ws.join("sub/roundtrip")).unwrap(),
+        ws.join("a.txt")
+    );
+    assert_eq!(
+        s["symlinks_retargeted"],
+        serde_json::json!(["dist", "sub/roundtrip"])
+    );
+}
+
+#[test]
+fn w2_cross_record_spoofing_and_corrupt_json_are_cleaned_by_gc() {
+    let e = Env::new();
+    let victim = path_of(&e.ok(&["spawn", "victim"]));
+    let broken = path_of(&e.ok(&["spawn", "broken"]));
+    let dir = home_dir(&e);
+    let head = git(&e.repo, &["rev-parse", "HEAD"]);
+
+    // Forged `meta/evil.json` pointing to `victim`'s legitimate workspace path.
+    forge(&dir, "meta", "evil", &victim, "ready", &head);
+    assert!(e.err(&["drop", "evil"]).contains("corrupt"));
+    assert!(e.err(&["land", "evil", "-m", "x"]).contains("corrupt"));
+    assert!(e.err(&["path", "evil"]).contains("corrupt"));
+    assert_eq!(list_names(&e), ["broken", "victim"]);
+
+    // Truncated/corrupt JSON in `meta/broken.json`.
+    fs::write(dir.join("meta/broken.json"), "{broken").unwrap();
+    let dry = e.ok(&["gc", "--dry-run"]);
+    assert_eq!(dry["corrupt"], serde_json::json!(["broken", "evil"]));
+    assert!(dir.join("meta/broken.json").exists());
+
+    let g = e.ok(&["gc"]);
+    assert_eq!(g["corrupt"], serde_json::json!(["broken", "evil"]));
+    assert_eq!(g["orphans"], serde_json::json!(["broken"]));
+    assert!(!dir.join("meta/evil.json").exists());
+    assert!(!dir.join("meta/broken.json").exists());
+    assert!(!broken.exists());
+    assert!(victim.join("a.txt").exists(), "victim workspace untouched");
+    assert_eq!(list_names(&e), ["victim"]);
+
+    // `broken` can be spawned again once `gc` cleaned the corrupt record.
+    e.ok(&["spawn", "broken"]);
+}
+
+#[test]
+fn w2_dot_json_workspace_name_and_option_injection_guards() {
+    let e = Env::new();
+    let ws = path_of(&e.ok(&["spawn", "foo.json"]));
+    assert_eq!(list_names(&e), ["foo.json"]);
+    let dir = home_dir(&e);
+    // Leftover `.tmp.<pid>` files must not be read as records and are swept by `gc`.
+    fs::write(dir.join("meta/foo.json.tmp.12345"), "{bad").unwrap();
+    fs::write(dir.join("pool/@pool-1.json.tmp.12345"), "{bad").unwrap();
+    let g = e.ok(&["gc"]);
+    assert_eq!(g["corrupt"], serde_json::json!([]));
+    assert!(!dir.join("meta/foo.json.tmp.12345").exists());
+    assert!(!dir.join("pool/@pool-1.json.tmp.12345").exists());
+    assert!(ws.exists());
+    e.ok(&["drop", "foo.json"]);
+
+    // Option-like refs/bases must be rejected cleanly.
+    assert!(!e.err(&["spawn", "w1", "--base", "-foo"]).is_empty());
+    assert!(
+        !e.err(&["spawn", "w2", "--base", "--output=/tmp/x"])
+            .is_empty()
+    );
+    assert!(!e.err(&["prune", "--base", "-foo"]).is_empty());
+    fs::write(e.repo.join(".agent-ws.toml"), "prune_base = \"-foo\"\n").unwrap();
+    assert!(e.err(&["list"]).contains("not a valid ref name"));
+}
+
+#[test]
+fn w2_land_force_branch_and_no_verify_and_spawn_flags() {
+    use std::os::unix::fs::PermissionsExt;
+    let e = Env::new();
+    fs::write(e.repo.join("second.txt"), "2\n").unwrap();
+    git(&e.repo, &["add", "second.txt"]);
+    git(&e.repo, &["commit", "-qm", "second"]);
+    let head = git(&e.repo, &["rev-parse", "HEAD"]);
+    let parent = git(&e.repo, &["rev-parse", "HEAD~1"]);
+
+    // `spawn --base`, `--exclude`, `--no-pool`, `--min-free-gb`, `--branch`.
+    e.ok(&["pool", "set", "1"]);
+    e.ok(&["pool", "fill"]);
+    let s = e.ok(&[
+        "spawn",
+        "custom",
+        "--base",
+        "HEAD~1",
+        "--exclude",
+        "node_modules",
+        "--no-pool",
+    ]);
+    let ws_custom = path_of(&s);
+    assert_eq!(s["from_pool"], false);
+    assert_eq!(s["base"], parent);
+    assert!(!ws_custom.join("second.txt").exists());
+    assert!(!ws_custom.join("node_modules").exists());
+    assert!(
+        e.err(&[
+            "spawn",
+            "too-big",
+            "--no-pool",
+            "--min-free-gb",
+            "999999999"
+        ])
+        .contains("free on disk")
+    );
+
+    // `pool clear` empties the pool while preserving target.
+    assert_eq!(e.ok(&["pool", "clear"])["removed_extra"], 1);
+    assert_eq!(e.ok(&["pool", "status"])["target"], 1);
+    assert_eq!(e.ok(&["pool", "status"])["fresh"], 0);
+
+    // `spawn --branch` + `drop` deletes unused branch; `land` lands onto checked-out branch.
+    let _unused_b = path_of(&e.ok(&["spawn", "unused-b", "--branch", "feat/unused"]));
+    e.ok(&["drop", "unused-b"]);
+    assert!(
+        !git(&e.repo, &["branch", "--list", "feat/unused"]).contains("feat/unused"),
+        "unused branch removed on drop"
+    );
+
+    let ws_b = path_of(&e.ok(&["spawn", "b", "--branch", "feat/cli"]));
+    fs::write(ws_b.join("a.txt"), "branch edit\n").unwrap();
+    let lb = e.ok(&["land", "b", "-m", "feat: cli branch"]);
+    assert_eq!(lb["branch"], "feat/cli");
+    assert_eq!(git(&e.repo, &["show", "feat/cli:a.txt"]), "branch edit");
+
+    // `land --force-branch` overwrites an unrelated branch, and `--no-verify`
+    // skips both `pre_land` hooks and Git's `pre-commit` hook.
+    git(&e.repo, &["branch", "agent-ws/custom", &head]);
+    fs::write(
+        e.repo.join(".agent-ws.toml"),
+        "[hooks]\npre_land = [\"exit 1\"]\n",
+    )
+    .unwrap();
+    e.ok(&["trust"]);
+    let hook = e.repo.join(".git/hooks/pre-commit");
+    fs::write(&hook, "#!/bin/sh\nexit 1\n").unwrap();
+    fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+
+    fs::write(ws_custom.join("a.txt"), "forced\n").unwrap();
+    assert!(
+        e.err(&["land", "custom", "-m", "f"])
+            .contains("already exists")
+    );
+    assert!(
+        e.err(&["land", "custom", "-m", "f", "--force-branch"])
+            .contains("pre_land hook")
+    );
+    let lf = e.ok(&["land", "custom", "-m", "f", "--force-branch", "--no-verify"]);
+    assert_eq!(lf["branch"], "agent-ws/custom");
+    assert_eq!(git(&e.repo, &["show", "agent-ws/custom:a.txt"]), "forced");
+}
+
+#[test]
+fn w2_diff_stat_claude_project_scope_and_config_validation() {
+    let e = Env::new();
+    let ws = path_of(&e.ok(&["spawn", "w"]));
+    fs::write(ws.join("a.txt"), "one\nchanged\n").unwrap();
+    let stat = e.run(&["diff", "w", "--stat"]);
+    assert!(stat.status.success());
+    let text = String::from_utf8_lossy(&stat.stdout);
+    assert!(
+        text.contains("a.txt") && text.contains("1 file changed"),
+        "{text}"
+    );
+    assert!(
+        e.err(&["--json", "diff", "w", "--stat"])
+            .contains("--stat cannot be used with --json")
+    );
+
+    // `claude install --scope project` writes `.claude/settings.json`.
+    assert_eq!(
+        e.ok(&["claude", "install", "--scope", "project"])["changed"],
+        true
+    );
+    assert!(
+        fs::read_to_string(e.repo.join(".claude/settings.json"))
+            .unwrap()
+            .contains("agent-ws claude hook")
+    );
+    assert_eq!(
+        e.ok(&["claude", "uninstall", "--scope", "project"])["changed"],
+        true
+    );
+
+    // Config validation: `port_step = 0`, `..` in `exclude`, `/` in `secrets`.
+    for (toml, expected) in [
+        ("port_step = 0\n", "port_step must be >= 1"),
+        ("exclude = [\"../x\"]\n", "must not contain '..'"),
+        ("secrets = [\"a/b\"]\n", "without path separators"),
+    ] {
+        fs::write(e.repo.join(".agent-ws.toml"), toml).unwrap();
+        let err = e.err(&["list"]);
+        assert!(err.contains(expected), "{toml} -> {err}");
+    }
+}
