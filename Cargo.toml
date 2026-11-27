@@ -19,10 +19,19 @@ pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ target }.tar.gz"
 bin-dir = "{ bin }{ binary-ext }"
 pkg-fmt = "tgz"
 
+[features]
+default = ["cli"]
+cli = ["dep:clap", "dep:clap_complete"]
+
+[[bin]]
+name = "agent-ws"
+path = "src/main.rs"
+required-features = ["cli"]
+
 [dependencies]
 anyhow = "1.0.104"
-clap = { version = "4", features = ["derive"] }
-clap_complete = "4.6.11"
+clap = { version = "4", features = ["derive"], optional = true }
+clap_complete = { version = "4.6.11", optional = true }
 libc = "0.2.190"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = { version = "1.0.154", features = ["preserve_order"] }
