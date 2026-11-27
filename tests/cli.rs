@@ -105,6 +105,37 @@ impl Env {
         assert!(!out.status.success(), "agent-ws {args:?} should fail");
         String::from_utf8_lossy(&out.stderr).into_owned()
     }
+
+    fn err_json_in(&self, dir: &Path, args: &[&str]) -> serde_json::Value {
+        let mut a = vec!["--json"];
+        a.extend_from_slice(args);
+        let out = cmd(env!("CARGO_BIN_EXE_agent-ws"), dir)
+            .env("AGENT_WS_HOME", &self.home)
+            .env("AGENT_WS_NO_REFILL", "1")
+            .env("AGENT_WS_NO_AUTO_PRUNE", "1")
+            .args(&a)
+            .output()
+            .unwrap();
+        assert!(!out.status.success(), "agent-ws {a:?} should fail");
+        assert!(
+            out.stdout.is_empty(),
+            "expected empty stdout on --json error, got: {}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        let v: serde_json::Value = serde_json::from_slice(&out.stderr).unwrap_or_else(|err| {
+            panic!(
+                "stderr was not valid JSON ({err}): {}",
+                String::from_utf8_lossy(&out.stderr)
+            )
+        });
+        assert_eq!(v["ok"], false, "{v}");
+        assert!(v["error"].is_string(), "{v}");
+        v
+    }
+
+    fn err_json(&self, args: &[&str]) -> serde_json::Value {
+        self.err_json_in(&self.repo, args)
+    }
 }
 
 fn path_of(v: &serde_json::Value) -> PathBuf {
@@ -618,44 +649,87 @@ fn pool_serves_spawns_and_tracks_freshness() {
     assert_eq!(e.ok(&["spawn", "b1", "--keep-secrets"])["from_pool"], false);
     assert_eq!(e.ok(&["pool", "status"])["fresh"], 1);
 
-    // A new commit makes the pool stale; spawns stop using it.
+    // A new commit makes the pool refreshable (not stale); spawns refresh in-place.
     fs::write(e.repo.join("b.txt"), "moved\n").unwrap();
     git(&e.repo, &["commit", "-qam", "move head"]);
     let st = e.ok(&["pool", "status"]);
     assert_eq!(
-        (st["fresh"].as_u64(), st["stale"].as_u64()),
-        (Some(0), Some(1))
+        (
+            st["fresh"].as_u64(),
+            st["refreshable"].as_u64(),
+            st["stale"].as_u64()
+        ),
+        (Some(0), Some(1), Some(0))
     );
-    let fresh_spawn = e.ok(&["spawn", "c1"]);
-    assert_eq!(fresh_spawn["from_pool"], false);
+    let refreshed_spawn = e.ok(&["spawn", "c1"]);
+    assert_eq!(refreshed_spawn["from_pool"], true);
     assert_eq!(
-        fs::read_to_string(path_of(&fresh_spawn).join("b.txt")).unwrap(),
+        fs::read_to_string(path_of(&refreshed_spawn).join("b.txt")).unwrap(),
         "moved\n"
+    );
+
+    // Refill to 2, advance HEAD again, and verify `pool fill` refreshes in-place without re-cloning.
+    let f = e.ok(&["pool", "fill"]);
+    assert_eq!(
+        (f["created"].as_u64(), f["ready"].as_u64()),
+        (Some(2), Some(2))
+    );
+    fs::write(e.repo.join("b.txt"), "moved2\n").unwrap();
+    git(&e.repo, &["commit", "-qam", "move head again"]);
+    let st = e.ok(&["pool", "status"]);
+    assert_eq!(
+        (
+            st["fresh"].as_u64(),
+            st["refreshable"].as_u64(),
+            st["stale"].as_u64()
+        ),
+        (Some(0), Some(2), Some(0))
     );
     let f = e.ok(&["pool", "fill"]);
     assert_eq!(
-        (f["removed_stale"].as_u64(), f["created"].as_u64()),
-        (Some(1), Some(2))
+        (
+            f["refreshed"].as_u64(),
+            f["created"].as_u64(),
+            f["removed_stale"].as_u64(),
+            f["ready"].as_u64()
+        ),
+        (Some(2), Some(0), Some(0), Some(2))
     );
     let d1 = e.ok(&["spawn", "d1"]);
     assert_eq!(d1["from_pool"], true);
     assert_eq!(
         fs::read_to_string(path_of(&d1).join("b.txt")).unwrap(),
-        "moved\n"
+        "moved2\n"
     );
 
-    // Dependency changes make it stale too.
+    // Dependency stamp changes make the remaining entry stale (not refreshable);
+    // spawns bypass it and `pool clear` removes it.
     fs::write(e.repo.join("node_modules/.modules.yaml"), "changed").unwrap();
-    assert_eq!(e.ok(&["pool", "status"])["stale"], 1);
+    let st = e.ok(&["pool", "status"]);
+    assert_eq!(
+        (
+            st["fresh"].as_u64(),
+            st["refreshable"].as_u64(),
+            st["stale"].as_u64()
+        ),
+        (Some(0), Some(0), Some(1))
+    );
+    let bypassed = e.ok(&["spawn", "e1"]);
+    assert_eq!(bypassed["from_pool"], false);
+    assert_eq!(
+        fs::read_to_string(path_of(&bypassed).join("node_modules/.modules.yaml")).unwrap(),
+        "changed"
+    );
     assert_eq!(e.ok(&["pool", "clear"])["removed_stale"], 1);
     let st = e.ok(&["pool", "status"]);
     assert_eq!(
         (
             st["target"].as_u64(),
             st["fresh"].as_u64(),
+            st["refreshable"].as_u64(),
             st["stale"].as_u64()
         ),
-        (Some(2), Some(0), Some(0))
+        (Some(2), Some(0), Some(0), Some(0))
     );
     assert_eq!(e.ok(&["gc"])["orphans"], serde_json::json!([]));
 }
@@ -2288,10 +2362,13 @@ fn w2_diff_stat_claude_project_scope_and_config_validation() {
         text.contains("a.txt") && text.contains("1 file changed"),
         "{text}"
     );
-    assert!(
-        e.err(&["--json", "diff", "w", "--stat"])
-            .contains("--stat cannot be used with --json")
-    );
+    let stat_json = e.ok(&["diff", "w", "--stat"]);
+    let arr = stat_json.as_array().unwrap();
+    assert_eq!(arr.len(), 1);
+    assert_eq!(arr[0]["path"], "a.txt");
+    assert_eq!(arr[0]["status"], "M");
+    assert_eq!(arr[0]["added"], 1);
+    assert_eq!(arr[0]["deleted"], 0);
 
     // `claude install --scope project` writes `.claude/settings.json`.
     assert_eq!(
@@ -2317,5 +2394,645 @@ fn w2_diff_stat_claude_project_scope_and_config_validation() {
         fs::write(e.repo.join(".agent-ws.toml"), toml).unwrap();
         let err = e.err(&["list"]);
         assert!(err.contains(expected), "{toml} -> {err}");
+    }
+}
+
+// ---- v0.5.0 integration tests (perf, storage, CoW, agent-native CLI) ----
+
+fn write_synced(path: &Path, data: &[u8]) {
+    use std::io::Write;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).unwrap();
+    }
+    let mut f = fs::File::create(path).unwrap();
+    f.write_all(data).unwrap();
+    f.sync_all().unwrap();
+}
+
+#[test]
+fn v05_glob_exclude_and_scan_skip() {
+    let e = Env::new();
+    fs::write(
+        e.repo.join(".gitignore"),
+        "node_modules/\n**/node_modules/\napps/*/dist/\n*.log\ntarget/\n.env\n.env.*\n!.env.example\ndist\nout/\next\n",
+    )
+    .unwrap();
+    fs::create_dir_all(e.repo.join("apps/web/src")).unwrap();
+    fs::write(e.repo.join("apps/web/src/app.ts"), "export const x = 1;\n").unwrap();
+    git(&e.repo, &["add", ".gitignore", "apps/web/src/app.ts"]);
+    git(&e.repo, &["commit", "-qm", "glob layout"]);
+
+    fs::create_dir_all(e.repo.join("packages/ui/node_modules/pkg")).unwrap();
+    fs::write(e.repo.join("packages/ui/node_modules/pkg/index.js"), "1").unwrap();
+    fs::create_dir_all(e.repo.join("apps/web/dist")).unwrap();
+    fs::write(e.repo.join("apps/web/dist/bundle.js"), "b").unwrap();
+    fs::create_dir_all(e.repo.join("apps/api/dist")).unwrap();
+    fs::write(e.repo.join("apps/api/dist/server.js"), "s").unwrap();
+    fs::write(e.repo.join("debug.log"), "root log").unwrap();
+    fs::write(e.repo.join("apps/web/error.log"), "nested log").unwrap();
+    fs::create_dir_all(e.repo.join("target/debug")).unwrap();
+    fs::write(e.repo.join("target/debug/.env"), "SKIPPED_SECRET=1\n").unwrap();
+
+    fs::write(
+        e.repo.join(".agent-ws.toml"),
+        "exclude = [\"**/node_modules\", \"apps/*/dist\", \"*.log\"]\n\
+         scan_skip = [\"target\"]\n",
+    )
+    .unwrap();
+
+    let s = e.ok(&["spawn", "glob-ws"]);
+    let ws = path_of(&s);
+    assert!(!ws.join("node_modules").exists());
+    assert!(!ws.join("packages/ui/node_modules").exists());
+    assert!(!ws.join("apps/web/dist").exists());
+    assert!(!ws.join("apps/api/dist").exists());
+    assert!(!ws.join("debug.log").exists());
+    // `*.log` matches only top-level `*.log`, not nested paths.
+    assert!(ws.join("apps/web/error.log").exists());
+    assert!(ws.join("apps/web/src/app.ts").exists());
+
+    // `scan_skip = ["target"]` keeps `target/debug/.env` untouched while root `.env` is stripped.
+    assert!(ws.join("target/debug/.env").exists());
+    assert!(!ws.join(".env").exists());
+    let removed = s["secrets_removed"].as_array().unwrap();
+    assert!(removed.contains(&serde_json::json!(".env")), "{removed:?}");
+    assert!(
+        !removed.contains(&serde_json::json!("target/debug/.env")),
+        "{removed:?}"
+    );
+}
+
+#[test]
+fn v05_spawn_from_forks_workspace_and_rejects_conflicting_flags() {
+    let e = Env::new();
+    let parent = path_of(&e.ok(&["spawn", "parent"]));
+    let parent_base = git(&parent, &["rev-parse", "HEAD"]);
+
+    // Advance source repo HEAD after parent spawned so parent's base differs from main HEAD.
+    fs::write(e.repo.join("upstream.txt"), "upstream\n").unwrap();
+    git(&e.repo, &["add", "upstream.txt"]);
+    git(&e.repo, &["commit", "-qm", "upstream"]);
+
+    // Parent has a local commit, unstaged edit, staged file, untracked file, and warm cache file.
+    fs::write(parent.join("committed.txt"), "c\n").unwrap();
+    git(&parent, &["add", "committed.txt"]);
+    git(&parent, &["commit", "-qm", "parent commit"]);
+    fs::write(parent.join("a.txt"), "unstaged edit\n").unwrap();
+    fs::write(parent.join("staged.txt"), "staged\n").unwrap();
+    git(&parent, &["add", "staged.txt"]);
+    fs::write(parent.join("notes.txt"), "untracked\n").unwrap();
+    fs::write(parent.join("node_modules/dep/cached.js"), "cached\n").unwrap();
+
+    let child_json = e.ok(&["spawn", "child", "--from", "parent"]);
+    let child = path_of(&child_json);
+    assert_eq!(child_json["base"], parent_base);
+    assert_eq!(child_json["from_pool"], false);
+    assert!(!child.join("upstream.txt").exists());
+    assert_eq!(
+        fs::read_to_string(child.join("committed.txt")).unwrap(),
+        "c\n"
+    );
+    assert_eq!(
+        fs::read_to_string(child.join("a.txt")).unwrap(),
+        "unstaged edit\n"
+    );
+    assert_eq!(
+        fs::read_to_string(child.join("notes.txt")).unwrap(),
+        "untracked\n"
+    );
+    assert_eq!(
+        fs::read_to_string(child.join("node_modules/dep/cached.js")).unwrap(),
+        "cached\n"
+    );
+    let st = git(&child, &["status", "--porcelain"]);
+    assert!(st.contains("A  staged.txt"), "{st}");
+    assert!(st.contains("M a.txt"), "{st}");
+    assert!(st.contains("?? notes.txt"), "{st}");
+
+    // Independent git worktree: edits in child do not leak to parent.
+    let wt = git(&e.repo, &["worktree", "list"]);
+    assert!(wt.contains("parent") && wt.contains("child"), "{wt}");
+    fs::write(child.join("a.txt"), "child only\n").unwrap();
+    assert_eq!(
+        fs::read_to_string(parent.join("a.txt")).unwrap(),
+        "unstaged edit\n"
+    );
+
+    // Rejects `--from` combined with `--base` or `--carry`, and missing source workspace.
+    assert!(
+        !e.err(&["spawn", "bad1", "--from", "parent", "--base", "HEAD"])
+            .is_empty()
+    );
+    assert!(
+        !e.err(&["spawn", "bad2", "--from", "parent", "--carry"])
+            .is_empty()
+    );
+    assert_eq!(
+        e.err_json(&["spawn", "bad3", "--from", "missing"])["code"],
+        "NOT_FOUND"
+    );
+}
+
+#[test]
+fn v05_spawn_ensure_and_auto_name() {
+    let e = Env::new();
+    let first = e.ok(&["spawn", "worker", "--ensure"]);
+    assert_eq!(first["name"], "worker");
+    assert_eq!(first["reused"], false);
+
+    let reused = e.ok(&["spawn", "worker", "--ensure"]);
+    assert_eq!(reused["name"], "worker");
+    assert_eq!(reused["reused"], true);
+    assert_eq!(reused["path"], first["path"]);
+    assert_eq!(reused["port"], first["port"]);
+
+    // `--ensure` with conflicting `--branch` fails with INVALID_INPUT.
+    assert_eq!(
+        e.err_json(&["spawn", "worker", "--ensure", "--branch", "other"])["code"],
+        "INVALID_INPUT"
+    );
+
+    // `--auto` picks `-2`, `-3` when the base name is taken.
+    let auto2 = e.ok(&["spawn", "worker", "--auto"]);
+    assert_eq!(auto2["name"], "worker-2");
+    assert_eq!(auto2["reused"], false);
+
+    let auto3 = e.ok(&["spawn", "worker", "--auto"]);
+    assert_eq!(auto3["name"], "worker-3");
+    assert_eq!(auto3["reused"], false);
+
+    // `--ensure` and `--auto` cannot be combined.
+    assert!(!e.err(&["spawn", "worker", "--ensure", "--auto"]).is_empty());
+}
+
+#[test]
+fn v05_drop_if_exists_and_self_action_guard() {
+    let e = Env::new();
+    let absent = e.ok(&["drop", "nope", "--if-exists"]);
+    assert_eq!(absent["name"], "nope");
+    assert_eq!(absent["dropped"], false);
+
+    let ws = path_of(&e.ok(&["spawn", "self-ws"]));
+    let sub = ws.join("nested");
+    fs::create_dir(&sub).unwrap();
+    fs::write(ws.join("a.txt"), "edited\n").unwrap();
+
+    // `drop` and `land` from inside the target workspace are blocked by default.
+    let drop_err = e.err_json_in(&sub, &["drop", "self-ws"]);
+    assert_eq!(drop_err["code"], "SELF_ACTION_BLOCKED");
+    assert!(ws.exists());
+
+    let land_err = e.err_json_in(&sub, &["land", "self-ws", "-m", "blocked"]);
+    assert_eq!(land_err["code"], "SELF_ACTION_BLOCKED");
+    assert!(ws.exists());
+
+    // `--allow-self` permits both `land` and `drop` from inside the workspace.
+    let landed = cmd(env!("CARGO_BIN_EXE_agent-ws"), &sub)
+        .env("AGENT_WS_HOME", &e.home)
+        .env("AGENT_WS_NO_REFILL", "1")
+        .env("AGENT_WS_NO_AUTO_PRUNE", "1")
+        .args([
+            "--json",
+            "land",
+            "self-ws",
+            "-m",
+            "allowed",
+            "--keep",
+            "--allow-self",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        landed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&landed.stderr)
+    );
+    let landed_v: serde_json::Value = serde_json::from_slice(&landed.stdout).unwrap();
+    assert_eq!(landed_v["branch"], "agent-ws/self-ws");
+    assert_eq!(landed_v["dropped"], false);
+
+    let dropped = cmd(env!("CARGO_BIN_EXE_agent-ws"), &sub)
+        .env("AGENT_WS_HOME", &e.home)
+        .env("AGENT_WS_NO_REFILL", "1")
+        .env("AGENT_WS_NO_AUTO_PRUNE", "1")
+        .args(["--json", "drop", "self-ws", "--allow-self"])
+        .output()
+        .unwrap();
+    assert!(
+        dropped.status.success(),
+        "{}",
+        String::from_utf8_lossy(&dropped.stderr)
+    );
+    let dropped_v: serde_json::Value = serde_json::from_slice(&dropped.stdout).unwrap();
+    assert_eq!(dropped_v["dropped"], true);
+    assert!(!ws.exists());
+
+    assert_eq!(e.ok(&["drop", "self-ws", "--if-exists"])["dropped"], false);
+}
+
+#[test]
+fn v05_snap_snaps_restore_and_drop_cleanup() {
+    let e = Env::new();
+    let ws = path_of(&e.ok(&["spawn", "snap-ws"]));
+
+    fs::write(ws.join("committed.txt"), "c1\n").unwrap();
+    git(&ws, &["add", "committed.txt"]);
+    git(&ws, &["commit", "-qm", "c1"]);
+    let head1 = git(&ws, &["rev-parse", "HEAD"]);
+
+    fs::write(ws.join("a.txt"), "at-cp1\n").unwrap();
+    fs::write(ws.join("staged.txt"), "staged\n").unwrap();
+    git(&ws, &["add", "staged.txt"]);
+    fs::write(ws.join("untracked.txt"), "untracked\n").unwrap();
+
+    let cp1 = e.ok(&["snap", "snap-ws", "cp1"]);
+    assert_eq!(cp1["name"], "cp1");
+    assert_eq!(cp1["workspace"], "snap-ws");
+    assert_eq!(cp1["head"], head1);
+
+    // Auto-named snapshot + listing.
+    let auto_snap = e.ok(&["snap", "snap-ws"]);
+    let snaps = e.ok(&["snaps", "snap-ws"]);
+    let snap_names: Vec<&str> = snaps
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["name"].as_str().unwrap())
+        .collect();
+    assert!(snap_names.contains(&"cp1"));
+    assert!(snap_names.contains(&auto_snap["name"].as_str().unwrap()));
+
+    // Mutate further: modify, create new file, delete existing tracked file, and advance HEAD.
+    fs::write(ws.join("a.txt"), "mutated\n").unwrap();
+    fs::write(ws.join("extra.txt"), "should vanish\n").unwrap();
+    fs::remove_file(ws.join("b.txt")).unwrap();
+    fs::write(ws.join("c2.txt"), "c2\n").unwrap();
+    git(&ws, &["add", "c2.txt"]);
+    git(&ws, &["commit", "-qm", "c2"]);
+
+    // Restore `cp1`.
+    let r1 = e.ok(&["restore", "snap-ws", "cp1"]);
+    assert_eq!(r1["name"], "cp1");
+    assert_eq!(git(&ws, &["rev-parse", "HEAD"]), head1);
+    assert_eq!(fs::read_to_string(ws.join("a.txt")).unwrap(), "at-cp1\n");
+    assert_eq!(fs::read_to_string(ws.join("b.txt")).unwrap(), "bee\n");
+    assert_eq!(
+        fs::read_to_string(ws.join("untracked.txt")).unwrap(),
+        "untracked\n"
+    );
+    assert!(!ws.join("extra.txt").exists());
+    assert!(!ws.join("c2.txt").exists());
+    let dotgit_md = fs::symlink_metadata(ws.join(".git")).unwrap();
+    assert!(dotgit_md.is_file() && !dotgit_md.file_type().is_symlink());
+    let st = git(&ws, &["status", "--porcelain"]);
+    assert!(st.contains("A  staged.txt"), "{st}");
+    assert!(st.contains("M a.txt"), "{st}");
+    assert!(st.contains("?? untracked.txt"), "{st}");
+
+    // Repeatable restore: mutate again and restore `cp1` a second time.
+    fs::write(ws.join("a.txt"), "mutated-again\n").unwrap();
+    fs::remove_file(ws.join("b.txt")).unwrap();
+    fs::write(ws.join("extra2.txt"), "vanish2\n").unwrap();
+    let r2 = e.ok(&["restore", "snap-ws", "cp1"]);
+    assert_eq!(r2["name"], "cp1");
+    assert_eq!(fs::read_to_string(ws.join("a.txt")).unwrap(), "at-cp1\n");
+    assert_eq!(fs::read_to_string(ws.join("b.txt")).unwrap(), "bee\n");
+    assert!(!ws.join("extra2.txt").exists());
+
+    // `snap --drop` deletes `cp1`.
+    let dropped = e.ok(&["snap", "snap-ws", "cp1", "--drop"]);
+    assert_eq!(dropped["dropped"], true);
+    let remaining = e.ok(&["snaps", "snap-ws"]);
+    assert_eq!(remaining.as_array().unwrap().len(), 1);
+    assert_eq!(
+        e.err_json(&["restore", "snap-ws", "cp1"])["code"],
+        "NOT_FOUND"
+    );
+
+    // Dropping the workspace cleans up its snapshots folder.
+    let snaps_dir = home_dir(&e).join("snaps/snap-ws");
+    assert!(snaps_dir.exists());
+    e.ok(&["drop", "snap-ws"]);
+    assert!(!snaps_dir.exists());
+}
+
+#[test]
+fn v05_sync_rebase_merge_conflict_and_resync_deps() {
+    let e = Env::new();
+    let w1 = path_of(&e.ok(&["spawn", "w1"]));
+    let w2 = path_of(&e.ok(&["spawn", "w2"]));
+
+    fs::write(w1.join("w1.txt"), "w1\n").unwrap();
+    git(&w1, &["add", "w1.txt"]);
+    git(&w1, &["commit", "-qm", "w1 commit"]);
+
+    fs::write(w2.join("w2.txt"), "w2\n").unwrap();
+    git(&w2, &["add", "w2.txt"]);
+    git(&w2, &["commit", "-qm", "w2 commit"]);
+
+    // Advance main and update source deps.
+    fs::write(e.repo.join("main.txt"), "main\n").unwrap();
+    git(&e.repo, &["add", "main.txt"]);
+    git(&e.repo, &["commit", "-qm", "main commit"]);
+    let new_main = git(&e.repo, &["rev-parse", "HEAD"]);
+    fs::write(e.repo.join("node_modules/dep/index.js"), "v2\n").unwrap();
+    fs::write(e.repo.join("node_modules/dep/.env"), "SECRET=bad\n").unwrap();
+
+    // Dirty tree is rejected with DIRTY.
+    fs::write(w1.join("dirty.txt"), "x\n").unwrap();
+    assert_eq!(e.err_json(&["sync", "w1"])["code"], "DIRTY");
+    fs::remove_file(w1.join("dirty.txt")).unwrap();
+
+    // Rebase + `--resync-deps`.
+    let synced = e.ok(&["sync", "w1", "--resync-deps"]);
+    assert_eq!(synced["mode"], "rebase");
+    assert_eq!(synced["new_base"], new_main);
+    assert!(w1.join("main.txt").exists());
+    assert!(w1.join("w1.txt").exists());
+    assert_eq!(
+        fs::read_to_string(w1.join("node_modules/dep/index.js")).unwrap(),
+        "v2\n"
+    );
+    assert!(!w1.join("node_modules/dep/.env").exists());
+    assert!(
+        synced["resync"]["resynced"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!("node_modules"))
+    );
+
+    // `--merge` mode.
+    let merged = e.ok(&["sync", "w2", "--merge"]);
+    assert_eq!(merged["mode"], "merge");
+    assert_eq!(merged["new_base"], new_main);
+    assert!(w2.join("main.txt").exists());
+    assert!(w2.join("w2.txt").exists());
+
+    // `resync-deps` alone refreshes ignored deps without touching tracked edits and rejects tracked paths.
+    fs::write(e.repo.join("node_modules/dep/index.js"), "v3\n").unwrap();
+    fs::write(w2.join("a.txt"), "tracked-edit\n").unwrap();
+    let rd = e.ok(&["resync-deps", "w2"]);
+    assert!(
+        rd["resynced"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!("node_modules"))
+    );
+    assert_eq!(
+        fs::read_to_string(w2.join("node_modules/dep/index.js")).unwrap(),
+        "v3\n"
+    );
+    assert_eq!(
+        fs::read_to_string(w2.join("a.txt")).unwrap(),
+        "tracked-edit\n"
+    );
+    assert_eq!(
+        e.err_json(&["resync-deps", "w2", "a.txt"])["code"],
+        "INVALID_INPUT"
+    );
+
+    // Conflict during rebase and merge aborts cleanly leaving workspace untouched.
+    fs::write(w1.join("a.txt"), "ws-conflict\n").unwrap();
+    git(&w1, &["commit", "-qam", "ws conflict"]);
+    let w1_head_before = git(&w1, &["rev-parse", "HEAD"]);
+    fs::write(e.repo.join("a.txt"), "main-conflict\n").unwrap();
+    git(&e.repo, &["commit", "-qam", "main conflict"]);
+
+    let rebase_err = e.err_json(&["sync", "w1"]);
+    assert_eq!(rebase_err["code"], "CONFLICT");
+    assert_eq!(git(&w1, &["status", "--porcelain"]), "");
+    assert_eq!(git(&w1, &["rev-parse", "HEAD"]), w1_head_before);
+
+    let merge_err = e.err_json(&["sync", "w1", "--merge"]);
+    assert_eq!(merge_err["code"], "CONFLICT");
+    assert_eq!(git(&w1, &["status", "--porcelain"]), "");
+    assert_eq!(git(&w1, &["rev-parse", "HEAD"]), w1_head_before);
+}
+
+#[test]
+fn v05_du_depth_cohort_reclaimable_and_max_private_gb() {
+    let e = Env::new();
+    // Write a 1 MiB synced ignored file so both workspaces share a real CoW extent.
+    write_synced(
+        &e.repo.join("node_modules/shared.bin"),
+        &vec![0x42u8; 1 << 20],
+    );
+
+    let w1 = path_of(&e.ok(&["spawn", "w1"]));
+    let _w2 = path_of(&e.ok(&["spawn", "w2"]));
+
+    // Remove the file in the source checkout so `w1` and `w2` become an orphan CoW cohort.
+    fs::remove_file(e.repo.join("node_modules/shared.bin")).unwrap();
+
+    // Add a 1 MiB private file inside `w1/privdir` to populate private bytes & depth-1 breakdown.
+    write_synced(&w1.join("privdir/priv.bin"), &vec![0x77u8; 1 << 20]);
+
+    fs::write(e.repo.join(".agent-ws.toml"), "max_private_gb = 5\n").unwrap();
+    let du = e.ok(&["du", "--depth", "1"]);
+    assert_eq!(du["budget_bytes"], 5_000_000_000u64);
+
+    let total_private = du["total"]["private"].as_u64().unwrap();
+    let cohort_shared = du["cohort_shared_bytes"].as_u64().unwrap();
+    let reclaimable = du["reclaimable_bytes"].as_u64().unwrap();
+    assert!(total_private >= (1 << 20), "{du}");
+    assert!(
+        cohort_shared > 0,
+        "expected cohort_shared_bytes > 0 when 2 workspaces share orphan clone: {du}"
+    );
+    assert!(
+        reclaimable >= total_private + cohort_shared,
+        "reclaimable={reclaimable}, total_private={total_private}, cohort_shared={cohort_shared}"
+    );
+
+    let w1_entry = du["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["name"] == "w1")
+        .unwrap();
+    let breakdown = w1_entry["breakdown"].as_array().unwrap();
+    assert!(!breakdown.is_empty(), "{w1_entry}");
+    assert!(
+        breakdown.iter().any(|b| b["path"] == "privdir"),
+        "{breakdown:?}"
+    );
+
+    // Setting `max_private_gb = 0` emits a warning on `spawn` when private bytes > 0.
+    fs::write(e.repo.join(".agent-ws.toml"), "max_private_gb = 0\n").unwrap();
+    let w3 = e.ok(&["spawn", "w3"]);
+    let warnings = w3["warnings"].as_array().unwrap();
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.as_str().is_some_and(|s| s.contains("max_private_gb"))),
+        "{warnings:?}"
+    );
+}
+
+#[test]
+fn v05_prune_target_free_gb_dry_run_and_exec() {
+    let e = Env::new();
+    let big = path_of(&e.ok(&["spawn", "big"]));
+    let small = path_of(&e.ok(&["spawn", "small"]));
+    let dirty = path_of(&e.ok(&["spawn", "dirty"]));
+    let unmerged = path_of(&e.ok(&["spawn", "unmerged"]));
+
+    // Make `big` hold 1 MiB private and merge its commit into `main` so it is clean & merged.
+    write_synced(&big.join("big.bin"), &vec![0x5Au8; 1 << 20]);
+    git(&big, &["add", "big.bin"]);
+    git(&big, &["commit", "-qm", "big commit"]);
+    let big_head = git(&big, &["rev-parse", "HEAD"]);
+    git(&e.repo, &["merge", "-q", "--ff-only", &big_head]);
+
+    // `dirty` has uncommitted edits; `unmerged` has an unmerged commit.
+    fs::write(dirty.join("a.txt"), "dirty\n").unwrap();
+    fs::write(unmerged.join("u.txt"), "unmerged\n").unwrap();
+    git(&unmerged, &["add", "u.txt"]);
+    git(&unmerged, &["commit", "-qm", "unmerged commit"]);
+
+    // Put 1 entry in the pool so we can verify high `--target-free-gb` clears the pool on execution.
+    e.ok(&["pool", "fill", "--size", "1"]);
+
+    // Target 0 GB: free disk is already above target, so nothing is pruned.
+    let zero_dry = e.ok(&[
+        "prune",
+        "--dry-run",
+        "--base",
+        "main",
+        "--min-age-min",
+        "0",
+        "--target-free-gb",
+        "0",
+    ]);
+    assert_eq!(zero_dry["pruned"], serde_json::json!([]));
+    assert!(big.exists() && small.exists());
+
+    // Huge target in dry-run: selects clean eligible workspaces largest-first, keeps dirty/unmerged, touches nothing.
+    let huge_dry = e.ok(&[
+        "prune",
+        "--dry-run",
+        "--base",
+        "main",
+        "--min-age-min",
+        "0",
+        "--target-free-gb",
+        "999999999",
+    ]);
+    assert_eq!(huge_dry["dry_run"], true);
+    assert_eq!(names(&huge_dry, "pruned"), ["big", "small"]);
+    assert_eq!(huge_dry["pruned"][0]["name"], "big");
+    assert_eq!(names(&huge_dry, "kept"), ["dirty", "unmerged"]);
+    assert!(big.exists() && small.exists() && dirty.exists() && unmerged.exists());
+    assert_eq!(e.ok(&["pool", "status"])["fresh"], 1);
+
+    // Execute with huge target: drops `big` and `small`, clears pool, never drops `dirty` or `unmerged`.
+    let huge_exec = e.ok(&[
+        "prune",
+        "--base",
+        "main",
+        "--min-age-min",
+        "0",
+        "--target-free-gb",
+        "999999999",
+    ]);
+    assert_eq!(huge_exec["dry_run"], false);
+    assert_eq!(names(&huge_exec, "pruned"), ["big", "small"]);
+    assert_eq!(names(&huge_exec, "kept"), ["dirty", "unmerged"]);
+    assert!(!big.exists() && !small.exists());
+    assert!(dirty.exists() && unmerged.exists());
+    assert_eq!(e.ok(&["pool", "status"])["fresh"], 0);
+}
+
+#[test]
+fn v05_whoami_structured_json_errors_log_json_and_skill() {
+    let e = Env::new();
+
+    // `whoami` from source repo.
+    let outside = e.ok(&["whoami"]);
+    assert_eq!(outside["inside_workspace"], false);
+    assert_eq!(outside["name"], serde_json::Value::Null);
+    assert_eq!(outside["repo_root"], e.repo.to_str().unwrap());
+
+    // `whoami` from inside a workspace (nested dir), with and without `--status`.
+    let w1 = path_of(&e.ok(&["spawn", "w1", "--branch", "feat/who"]));
+    let w2 = path_of(&e.ok(&["spawn", "w2"]));
+    fs::write(w1.join("a.txt"), "w1-edit\n").unwrap();
+    fs::write(w2.join("a.txt"), "w2-edit\n").unwrap();
+    let sub = w1.join("nested");
+    fs::create_dir(&sub).unwrap();
+
+    let run_in_sub = |args: &[&str]| -> serde_json::Value {
+        let mut a = vec!["--json"];
+        a.extend_from_slice(args);
+        let out = cmd(env!("CARGO_BIN_EXE_agent-ws"), &sub)
+            .env("AGENT_WS_HOME", &e.home)
+            .args(&a)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        serde_json::from_slice(&out.stdout).unwrap()
+    };
+
+    let who = run_in_sub(&["whoami"]);
+    assert_eq!(who["inside_workspace"], true);
+    assert_eq!(who["name"], "w1");
+    assert_eq!(who["branch"], "feat/who");
+    assert_eq!(who["port"], 4100);
+    assert!(who.get("overlaps").is_none());
+    assert!(who.get("conflicts").is_none());
+
+    let who_status = run_in_sub(&["whoami", "--status"]);
+    assert_eq!(who_status["inside_workspace"], true);
+    assert_eq!(who_status["name"], "w1");
+    assert_eq!(
+        who_status["overlaps"],
+        serde_json::json!({ "a.txt": ["w1", "w2"] })
+    );
+    let conflicts = who_status["conflicts"].as_array().unwrap();
+    assert_eq!(conflicts.len(), 1);
+    assert_eq!(conflicts[0]["paths"], serde_json::json!(["a.txt"]));
+
+    // Structured `--json` errors on stderr.
+    assert_eq!(e.err_json(&["spawn", "w1"])["code"], "ALREADY_EXISTS");
+    assert_eq!(e.err_json(&["drop", "nope"])["code"], "NOT_FOUND");
+    assert_eq!(
+        e.err_json_in(&sub, &["drop", "w1"])["code"],
+        "SELF_ACTION_BLOCKED"
+    );
+    assert_eq!(e.err_json(&["spawn", "../bad"])["code"], "INVALID_INPUT");
+
+    // `log --json`.
+    assert_eq!(e.err_json(&["log", "w1"])["code"], "NOT_FOUND");
+    let ex = e.run(&["exec", "w1", "--", "sh", "-c", "echo json-log-line"]);
+    assert!(ex.status.success());
+    let log = e.ok(&["log", "w1"]);
+    assert_eq!(log["name"], "w1");
+    assert!(
+        log["log"].as_str().unwrap().contains("json-log-line"),
+        "{log}"
+    );
+
+    // `agent-ws skill` prints valid YAML frontmatter and key commands.
+    let skill = e.run(&["skill"]);
+    assert!(skill.status.success());
+    let text = String::from_utf8(skill.stdout).unwrap();
+    assert!(text.starts_with("---\nname: agent-ws\n"), "{text}");
+    let after_open = &text[4..];
+    assert!(after_open.contains("\n---\n"), "{text}");
+    for kw in [
+        "spawn",
+        "whoami",
+        "snap",
+        "restore",
+        "sync",
+        "resync-deps",
+        "land",
+        "drop",
+    ] {
+        assert!(text.contains(kw), "skill missing {kw}");
     }
 }
