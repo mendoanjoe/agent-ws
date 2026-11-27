@@ -1,8 +1,40 @@
 use agent_ws::claude::{self, Scope};
-use agent_ws::{LandOpts, PruneOpts, Repo, SpawnOpts};
+use agent_ws::{LandOpts, PruneOpts, Repo, SpawnOpts, SyncOpts};
 use anyhow::{Context, Result, bail};
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use std::io::Read;
+
+const SKILL_MD: &str = r#"---
+name: agent-ws
+description: Create, checkpoint, sync, inspect, land, and clean up isolated copy-on-write workspaces with agent-ws.
+---
+
+# agent-ws Quick Workflow
+
+- **Create or reuse a workspace**:
+  - `agent-ws spawn <NAME> --ensure --json` (idempotent: reuses existing ready workspace)
+  - `agent-ws spawn <NAME> --auto --json` (picks `<NAME>`, `<NAME>-2`, ...)
+  - `agent-ws spawn <NAME> --from <SRC_WS> --json` (forks edits, staged index, and untracked files from `<SRC_WS>`)
+- **Inspect current context**:
+  - `agent-ws whoami --json` (shows `inside_workspace`, `name`, `base`, `branch`, `port`)
+  - `agent-ws whoami --status --json` (adds file `overlaps` and `conflicts`)
+- **Checkpoints (instant CoW snapshots)**:
+  - `agent-ws snap <WS> [SNAP] --json`
+  - `agent-ws snaps <WS> --json`
+  - `agent-ws restore <WS> [SNAP] --json` (latest if `SNAP` omitted)
+  - `agent-ws snap <WS> <SNAP> --drop --json`
+- **Sync & dependency refresh**:
+  - `agent-ws sync <WS> [--base REV] [--merge] [--resync-deps] --json`
+  - `agent-ws resync-deps <WS> [PATH ...] --json`
+- **Inspect & finish**:
+  - `agent-ws status [WS] --json`
+  - `agent-ws diff <WS> [--stat] --json`
+  - `agent-ws land <WS> -m "<msg>" [--allow-self] --json`
+  - `agent-ws drop <WS> --if-exists [--allow-self] --json`
+- **JSON errors**:
+  - With `--json`, failures print `{"ok":false,"code":"<CODE>","error":"..."}` to `stderr` and exit `1`.
+  - Codes: `ALREADY_EXISTS`, `NOT_FOUND`, `CONFLICT`, `DIRTY`, `UNTRUSTED_HOOKS`, `LOW_DISK`, `INVALID_INPUT`, `SELF_ACTION_BLOCKED`, `UNSUPPORTED_FS`, `GIT_ERROR`, `INTERNAL`.
+"#;
 
 /// Instant, isolated workspaces for coding agents (copy-on-write clones + Git worktrees).
 #[derive(Parser)]
@@ -45,6 +77,15 @@ enum Cmd {
         /// Skip the post_spawn hooks of .agent-ws.toml.
         #[arg(long)]
         no_hooks: bool,
+        /// Clone from an existing workspace instead of the main checkout.
+        #[arg(long, value_name = "WS", conflicts_with_all = ["base", "carry"])]
+        from: Option<String>,
+        /// Reuse an existing ready workspace instead of failing.
+        #[arg(long, conflicts_with = "auto_name")]
+        ensure: bool,
+        /// Pick the first unused name (`NAME`, `NAME-2`, ..., `NAME-100`).
+        #[arg(long = "auto")]
+        auto_name: bool,
     },
     /// Run a command in a workspace, with PORT and AGENT_WS_* set.
     Exec {
@@ -120,9 +161,20 @@ enum Cmd {
         /// Open the pull request as a draft.
         #[arg(long, requires = "pr")]
         draft: bool,
+        /// Allow landing even if your current directory is inside the workspace.
+        #[arg(long)]
+        allow_self: bool,
     },
     /// Remove a workspace without landing it.
-    Drop { name: String },
+    Drop {
+        name: String,
+        /// Succeed with dropped=false if the workspace does not exist.
+        #[arg(long)]
+        if_exists: bool,
+        /// Allow dropping even if your current directory is inside the workspace.
+        #[arg(long)]
+        allow_self: bool,
+    },
     /// Clean up after interrupted spawns, deleted folders and stale trash.
     Gc {
         /// Report only; change nothing.
@@ -147,9 +199,57 @@ enum Cmd {
         /// Keep workspaces that were never used (the automatic prune).
         #[arg(long, hide = true)]
         merged_only: bool,
+        /// Prune largest eligible workspaces (and pool if needed) until this much disk is free.
+        #[arg(long)]
+        target_free_gb: Option<u64>,
     },
     /// Real disk use per workspace: bytes not shared with any other file.
-    Du { name: Option<String> },
+    Du {
+        name: Option<String>,
+        /// Show per-directory breakdown to this depth (0 = summary only).
+        #[arg(long, default_value_t = 0)]
+        depth: usize,
+    },
+    /// Rebase or merge a clean workspace onto an updated base commit.
+    Sync {
+        name: String,
+        /// Target commit or branch (default: current repository HEAD).
+        #[arg(long)]
+        base: Option<String>,
+        /// Merge instead of rebasing.
+        #[arg(long)]
+        merge: bool,
+        /// Also CoW-refresh ignored dependency directories from the source checkout.
+        #[arg(long)]
+        resync_deps: bool,
+    },
+    /// Refresh ignored dependency directories from the source checkout.
+    ResyncDeps {
+        name: String,
+        /// Relative directory paths to refresh (auto-detected if omitted).
+        paths: Vec<String>,
+    },
+    /// Create or delete an instant CoW checkpoint of a workspace.
+    Snap {
+        name: String,
+        /// Snapshot name (generated automatically if omitted).
+        snap: Option<String>,
+        /// Delete the named snapshot.
+        #[arg(long, requires = "snap")]
+        drop: bool,
+    },
+    /// List snapshots of a workspace.
+    Snaps { name: String },
+    /// Restore a workspace from a snapshot (latest if SNAP is omitted).
+    Restore { name: String, snap: Option<String> },
+    /// Identify the workspace containing the current directory.
+    Whoami {
+        /// Also report file overlaps and merge conflicts.
+        #[arg(long)]
+        status: bool,
+    },
+    /// Print a self-contained SKILL.md guide for coding agents.
+    Skill,
     /// Keep ready workspaces so spawning takes milliseconds.
     Pool {
         #[command(subcommand)]
@@ -261,10 +361,21 @@ fn print<T: serde::Serialize>(json: bool, v: &T, human: impl FnOnce(&T)) -> Resu
 
 fn main() {
     let cli = Cli::parse();
+    let json = cli.json;
     match run(cli) {
         Ok(code) => std::process::exit(code),
         Err(e) => {
-            eprintln!("agent-ws: {e:#}");
+            if json {
+                let code = agent_ws::error_code(&e);
+                let payload = serde_json::json!({
+                    "ok": false,
+                    "code": code,
+                    "error": format!("{e:#}"),
+                });
+                eprintln!("{payload}");
+            } else {
+                eprintln!("agent-ws: {e:#}");
+            }
             std::process::exit(1);
         }
     }
@@ -311,6 +422,10 @@ fn prune_in_background(repo: &Repo) {
 /// Runs a command; returns the process exit code.
 fn run(cli: Cli) -> Result<i32> {
     match cli.cmd {
+        Cmd::Skill => {
+            print!("{SKILL_MD}");
+            Ok(0)
+        }
         Cmd::Completions { shell } => {
             clap_complete::generate(
                 shell,
@@ -458,6 +573,9 @@ fn repo_cmd(json: bool, repo: &Repo, cmd: Cmd) -> Result<i32> {
             carry,
             branch,
             no_hooks,
+            from,
+            ensure,
+            auto_name,
         } => {
             let opts = SpawnOpts {
                 name,
@@ -469,14 +587,21 @@ fn repo_cmd(json: bool, repo: &Repo, cmd: Cmd) -> Result<i32> {
                 carry,
                 branch,
                 no_hooks,
+                from,
+                ensure,
+                auto_name,
                 ..Default::default()
             };
             let s = repo.spawn(&opts)?;
-            refill_in_background(repo);
-            prune_in_background(repo);
+            if !s.reused {
+                refill_in_background(repo);
+                prune_in_background(repo);
+            }
             print(json, &s, |s| {
                 println!("{}  {}", s.name, s.path.display());
-                let how = if s.from_pool {
+                let how = if s.reused {
+                    "reused".to_string()
+                } else if s.from_pool {
                     "from pool".to_string()
                 } else {
                     format!("clone {} ms", s.clone_ms)
@@ -532,11 +657,17 @@ fn repo_cmd(json: bool, repo: &Repo, cmd: Cmd) -> Result<i32> {
             repo.exec(&name, &command, log || !std::io::stdout().is_terminal())
         }
         Cmd::Log { name } => match repo.run_log(&name, 1 << 20)? {
-            Some(text) => {
-                print!("{text}");
-                Ok(0)
-            }
-            None => bail!("no log for {name:?}: run `agent-ws exec {name} --log -- …`"),
+            Some(text) => print(
+                json,
+                &serde_json::json!({ "name": name, "log": text }),
+                |_| {
+                    print!("{text}");
+                },
+            ),
+            None => Err(agent_ws::coded_err(
+                agent_ws::ErrorCode::NotFound,
+                format!("no log for {name:?}: run `agent-ws exec {name} --log -- …`"),
+            )),
         },
         Cmd::List { long: false, .. } => print(json, &repo.list()?, |l| {
             for m in l {
@@ -617,9 +748,6 @@ fn repo_cmd(json: bool, repo: &Repo, cmd: Cmd) -> Result<i32> {
         }),
         Cmd::Diff { name, stat, paths } => {
             if json {
-                if stat {
-                    bail!("--stat cannot be used with --json");
-                }
                 return print(true, &repo.diff_files(&name, &paths)?, |_| {});
             }
             // Git pages and colours the patch as it does for `git diff`.
@@ -661,19 +789,25 @@ fn repo_cmd(json: bool, repo: &Repo, cmd: Cmd) -> Result<i32> {
             pr,
             pr_base,
             draft,
+            allow_self,
         } => {
-            let l = repo.land(&LandOpts {
-                name,
-                message,
-                branch,
-                force_branch,
-                keep,
-                no_verify,
-                squash,
-                pr,
-                pr_base,
-                draft,
-            })?;
+            let cwd = std::env::current_dir().ok();
+            let l = repo.land_from(
+                &LandOpts {
+                    name,
+                    message,
+                    branch,
+                    force_branch,
+                    keep,
+                    no_verify,
+                    squash,
+                    pr,
+                    pr_base,
+                    draft,
+                    allow_self,
+                },
+                cwd.as_deref(),
+            )?;
             print(json, &l, |l| {
                 println!(
                     "{} -> {} {} ({} files){}",
@@ -691,11 +825,24 @@ fn repo_cmd(json: bool, repo: &Repo, cmd: Cmd) -> Result<i32> {
                 }
             })
         }
-        Cmd::Drop { name } => {
-            repo.drop(&name)?;
-            print(json, &serde_json::json!({ "dropped": name }), |_| {
-                println!("dropped {name}")
-            })
+        Cmd::Drop {
+            name,
+            if_exists,
+            allow_self,
+        } => {
+            let cwd = std::env::current_dir().ok();
+            let dropped = repo.drop_with_opts(&name, if_exists, allow_self, cwd.as_deref())?;
+            print(
+                json,
+                &serde_json::json!({ "name": name, "dropped": dropped }),
+                |_| {
+                    if dropped {
+                        println!("dropped {name}");
+                    } else {
+                        println!("workspace {name:?} does not exist");
+                    }
+                },
+            )
         }
         Cmd::Gc { dry_run } => print(json, &repo.gc(dry_run)?, |g| {
             let verb = if dry_run { "would remove" } else { "removed" };
@@ -744,6 +891,7 @@ fn repo_cmd(json: bool, repo: &Repo, cmd: Cmd) -> Result<i32> {
             gh,
             min_age_min,
             merged_only,
+            target_free_gb,
         } => print(
             json,
             &repo.prune(&PruneOpts {
@@ -752,6 +900,7 @@ fn repo_cmd(json: bool, repo: &Repo, cmd: Cmd) -> Result<i32> {
                 gh,
                 min_age_secs: min_age_min.saturating_mul(60),
                 merged_only,
+                target_free_bytes: target_free_gb.map(|g| g.saturating_mul(1_000_000_000)),
             })?,
             |p| {
                 let verb = if dry_run { "would drop" } else { "dropped" };
@@ -781,28 +930,166 @@ fn repo_cmd(json: bool, repo: &Repo, cmd: Cmd) -> Result<i32> {
                 );
             },
         ),
-        Cmd::Du { name } => print(json, &repo.du(name.as_deref())?, |d| {
-            println!("{:>9} {:>9}  NAME", "REAL", "DU");
-            for e in &d.entries {
-                let kind = if e.kind == "workspace" {
-                    String::new()
-                } else {
-                    format!(" ({})", e.kind)
-                };
+        Cmd::Du { name, depth } => print(
+            json,
+            &repo.du_with_options(name.as_deref(), depth, true)?,
+            |d| {
+                println!("{:>9} {:>9}  NAME", "REAL", "DU");
+                for e in &d.entries {
+                    let kind = if e.kind == "workspace" {
+                        String::new()
+                    } else {
+                        format!(" ({})", e.kind)
+                    };
+                    println!(
+                        "{:>9} {:>9}  {}{kind}",
+                        human(e.usage.private),
+                        human(e.usage.allocated),
+                        e.name
+                    );
+                    for b in &e.breakdown {
+                        println!(
+                            "  {:>7} {:>9}    {}",
+                            human(b.usage.private),
+                            human(b.usage.allocated),
+                            b.path.display()
+                        );
+                    }
+                }
                 println!(
-                    "{:>9} {:>9}  {}{kind}",
-                    human(e.usage.private),
-                    human(e.usage.allocated),
-                    e.name
+                    "{:>9} {:>9}  total, {} free on disk",
+                    human(d.total.private),
+                    human(d.total.allocated),
+                    human(d.free_bytes)
                 );
+                if d.cohort_shared_bytes > 0 || d.reclaimable_bytes > d.total.private {
+                    println!(
+                        "cohort shared {}  reclaimable {}",
+                        human(d.cohort_shared_bytes),
+                        human(d.reclaimable_bytes)
+                    );
+                }
+                if let Some(budget) = d.budget_bytes {
+                    println!("budget {}", human(budget));
+                }
+            },
+        ),
+        Cmd::Sync {
+            name,
+            base,
+            merge,
+            resync_deps,
+        } => {
+            let s = repo.sync(&SyncOpts {
+                name,
+                base,
+                merge,
+                resync_deps,
+            })?;
+            print(json, &s, |s| {
+                println!(
+                    "{}  {} {} -> {} (HEAD {})",
+                    s.name,
+                    s.mode,
+                    short(&s.old_base),
+                    short(&s.new_base),
+                    short(&s.head)
+                );
+                if let Some(r) = &s.resync {
+                    println!(
+                        "resynced {} deps (freed {})",
+                        r.resynced.len(),
+                        human(r.freed_private_bytes)
+                    );
+                }
+            })
+        }
+        Cmd::ResyncDeps { name, paths } => {
+            let r = repo.resync_deps(&name, &paths)?;
+            print(json, &r, |r| {
+                if r.resynced.is_empty() {
+                    println!("no dependency directories resynced for {}", r.name);
+                } else {
+                    println!(
+                        "resynced {} for {} (freed {})",
+                        r.resynced.join(", "),
+                        r.name,
+                        human(r.freed_private_bytes)
+                    );
+                }
+            })
+        }
+        Cmd::Snap { name, snap, drop } => {
+            if drop {
+                let sname = snap.as_deref().context("--drop requires SNAP")?;
+                repo.snap_drop(&name, sname)?;
+                print(
+                    json,
+                    &serde_json::json!({ "workspace": name, "snap": sname, "dropped": true }),
+                    |_| println!("dropped snapshot {sname} for {name}"),
+                )
+            } else {
+                let info = repo.snap(&name, snap.as_deref())?;
+                print(json, &info, |s| {
+                    println!(
+                        "{}  {} (HEAD {}  base {})",
+                        s.name,
+                        s.path.display(),
+                        short(&s.head),
+                        short(&s.base)
+                    );
+                })
             }
-            println!(
-                "{:>9} {:>9}  total, {} free on disk",
-                human(d.total.private),
-                human(d.total.allocated),
-                human(d.free_bytes)
-            );
+        }
+        Cmd::Snaps { name } => print(json, &repo.snaps(&name)?, |list| {
+            for s in list {
+                println!("{:24} {}  {}", s.name, short(&s.head), s.path.display());
+            }
         }),
+        Cmd::Restore { name, snap } => {
+            let info = repo.restore(&name, snap.as_deref())?;
+            print(json, &info, |s| {
+                println!(
+                    "restored {} to {} (HEAD {})",
+                    s.workspace,
+                    s.name,
+                    short(&s.head)
+                );
+            })
+        }
+        Cmd::Whoami { status } => {
+            let cwd = std::env::current_dir()?;
+            let w = repo.whoami(&cwd, status)?;
+            print(json, &w, |w| {
+                if let Some(name) = &w.name {
+                    let mut line = name.to_string();
+                    if let Some(base) = &w.base {
+                        line.push_str(&format!("  base {}", short(base)));
+                    }
+                    if let Some(branch) = &w.branch {
+                        line.push_str(&format!("  branch {branch}"));
+                    }
+                    if let Some(port) = w.port {
+                        line.push_str(&format!("  port {port}"));
+                    }
+                    println!("{line}");
+                    for (p, names) in &w.overlaps {
+                        println!("OVERLAP {p}: {}", names.join(", "));
+                    }
+                    if let Some(conflicts) = &w.conflicts {
+                        for c in conflicts {
+                            println!(
+                                "CONFLICT {}: {}",
+                                c.workspaces.join(" + "),
+                                c.paths.join(", ")
+                            );
+                        }
+                    }
+                } else {
+                    println!("not inside a workspace (repo {})", w.repo_root.display());
+                }
+            })
+        }
         Cmd::Pool { cmd } => match cmd {
             PoolCmd::Set { size } => {
                 repo.pool_set(size)?;
@@ -815,15 +1102,15 @@ fn repo_cmd(json: bool, repo: &Repo, cmd: Cmd) -> Result<i32> {
                     println!("another fill is running");
                 } else {
                     println!(
-                        "{} ready (created {}, removed {} stale, {} extra)",
-                        f.ready, f.created, f.removed_stale, f.removed_extra
+                        "{} ready (created {}, refreshed {}, removed {} stale, {} extra)",
+                        f.ready, f.created, f.refreshed, f.removed_stale, f.removed_extra
                     );
                 }
             }),
             PoolCmd::Status => print(json, &repo.pool_status()?, |s| {
                 println!(
-                    "target {}  fresh {}  stale {}  creating {}",
-                    s.target, s.fresh, s.stale, s.creating
+                    "target {}  fresh {}  refreshable {}  stale {}  creating {}",
+                    s.target, s.fresh, s.refreshable, s.stale, s.creating
                 );
             }),
             PoolCmd::Clear => print(json, &repo.pool_fill(Some(0))?, |f| {
@@ -848,6 +1135,8 @@ fn repo_cmd(json: bool, repo: &Repo, cmd: Cmd) -> Result<i32> {
                 println!("trusted pre_land: {c}");
             }
         }),
-        Cmd::Completions { .. } | Cmd::Claude { .. } | Cmd::Repos => unreachable!("handled in run"),
+        Cmd::Skill | Cmd::Completions { .. } | Cmd::Claude { .. } | Cmd::Repos => {
+            unreachable!("handled in run")
+        }
     }
 }
