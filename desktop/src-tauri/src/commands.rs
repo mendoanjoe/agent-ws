@@ -91,6 +91,7 @@ pub async fn land(
             pr,
             pr_base: None,
             draft: false,
+            allow_self: false,
         })
     })
     .await
@@ -110,6 +111,7 @@ pub async fn prune(root: String, dry_run: bool) -> Res<Prune> {
             gh: false,
             min_age_secs: agent_ws::PRUNE_MIN_AGE_SECS,
             merged_only: false,
+            target_free_bytes: None,
         })
     })
     .await

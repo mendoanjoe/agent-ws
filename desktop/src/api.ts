@@ -47,25 +47,52 @@ export type FileChange = {
 
 export type Diff = { files: FileChange[]; patch: string; truncated: boolean };
 
-export type WsUsage = {
-  name: string;
-  path: string;
-  kind: "workspace" | "pool" | "trash";
+export type Usage = {
   files: number;
   logical: number;
   allocated: number;
   private: number;
 };
 
+export type DirUsage = {
+  path: string;
+  usage: Usage;
+};
+
+export type WsUsage = Usage & {
+  name: string;
+  path: string;
+  kind: "workspace" | "pool" | "trash";
+  breakdown?: DirUsage[];
+};
+
 export type Landed = {
+  name: string;
   branch: string;
   commit: string;
   files: number;
+  dropped: boolean;
+  overlaps: Record<string, string[]>;
+  pushed: boolean;
   pr_url?: string;
 };
 
-export type Pruned = { name: string; reason: string; private_bytes: number; branch?: string };
-export type Prune = { base: string; pruned: Pruned[]; kept: { name: string; why: string }[]; freed_bytes: number };
+export type Pruned = {
+  name: string;
+  path: string;
+  reason: string;
+  private_bytes: number;
+  branch?: string;
+};
+
+export type Prune = {
+  base: string;
+  base_commit: string;
+  dry_run: boolean;
+  pruned: Pruned[];
+  kept: { name: string; why: string }[];
+  freed_bytes: number;
+};
 
 export const api = {
   repos: () => invoke<Repo[]>("repos"),
