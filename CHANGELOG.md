@@ -6,6 +6,39 @@ All notable changes to agent-ws are listed here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- **Incremental Pool Refresh**: Pooled workspaces now key on `HEAD:<deps_key>`, where `<deps_key>` hashes workspace-shaping config (`exclude`, `secrets`, `secrets_keep`, `strict_symlinks`, `scan_skip`) and dependency stamp files. When only `HEAD` moves, `pool status` reports those entries as `refreshable` and `spawn` / `pool fill` refreshes them in place (`git checkout -f --detach` + `git clean -fdq`) instead of re-cloning.
+- **Glob `exclude` and `scan_skip`**: `exclude` and the new `scan_skip` option in `.agent-ws.toml` support `*`, `?`, and `**` path globs (for example `**/node_modules`, `apps/*/dist`, `*.log`). `clone_tree` still preserves single-syscall `clonefile(2)` on macOS for unaffected subtrees, and `scan_skip` prunes heavy directories from secret/symlink scans.
+- **Workspace forking (`spawn --from`)**: Clone a new workspace from an existing workspace instead of the main checkout, preserving its base commit, uncommitted edits, staged index state, untracked files, caches, and submodules.
+- **Idempotent & auto-named spawns (`spawn --ensure`, `spawn --auto`)**: `--ensure` reuses an existing ready workspace (`reused: true`) instead of failing, validating `--branch`/`--base` if provided; `--auto` picks the first free name from `NAME`, `NAME-2`, ..., `NAME-100`.
+- **Instant CoW checkpoints (`snap`, `snaps`, `restore`)**: Create named or auto-named CoW snapshots of a workspace tree, index, and `HEAD`, list them, delete them (`snap NAME SNAP --drop`), or restore a workspace to a snapshot (repeatable, latest by default).
+- **Sync and dependency refresh (`sync`, `resync-deps`)**: `agent-ws sync` rebases (or `--merge`s) a clean workspace onto an updated base commit (default `HEAD`), aborting cleanly on conflict and optionally refreshing dependencies with `--resync-deps`. `agent-ws resync-deps` atomically CoW-swaps git-ignored dependency directories (auto-detected `node_modules`, `.venv`, `venv`, `target`, `.next`, `.turbo`, `.nuxt`, `vendor`, `dist`, `build`, or explicit paths) from the source checkout.
+- **Cohort disk accounting, `du --depth`, `max_private_gb`, and `prune --target-free-gb`**:
+  - `agent-ws du --depth N` adds a per-directory usage breakdown to depth `N`.
+  - `agent-ws du` computes `cohort_shared_bytes` and `reclaimable_bytes` across workspaces, pool, and `.trash` using APFS `ATTR_CMNEXT_CLONEID` on macOS and Linux `FIEMAP` shared extent IDs, catching blocks orphaned when the source checkout reinstalls dependencies.
+  - `max_private_gb` in `.agent-ws.toml` warns during `spawn` when total private disk usage exceeds the budget and surfaces `budget` in `du`.
+  - `agent-ws prune --target-free-gb N` drops the largest eligible merged/clean workspaces (and clears the pool if needed) until at least `N` GB of disk space is free.
+- **Agent-native CLI & structured JSON errors**:
+  - `agent-ws whoami [--status]` identifies whether `cwd` is inside a workspace (and its `name`, `base`, `branch`, `port`, `overlaps`, `conflicts`).
+  - `agent-ws skill` prints a self-contained `SKILL.md` workflow guide for coding agents.
+  - `agent-ws drop --if-exists` succeeds with `dropped: false` when a workspace does not exist.
+  - Self-action guard: `land` and `drop` refuse to act on the workspace containing `cwd` (`SELF_ACTION_BLOCKED`) unless `--allow-self` is passed.
+  - `--json` errors print structured `{"ok":false,"code":"<CODE>","error":"..."}` payloads to `stderr` (`ALREADY_EXISTS`, `NOT_FOUND`, `CONFLICT`, `DIRTY`, `UNTRUSTED_HOOKS`, `LOW_DISK`, `INVALID_INPUT`, `SELF_ACTION_BLOCKED`, `UNSUPPORTED_FS`, `GIT_ERROR`, `INTERNAL`).
+  - `agent-ws diff --stat --json` and `agent-ws log --json` are now supported.
+
+### Changed
+
+- **Parallel filesystem & Git operations**: Linux `FICLONE` cloning now batches files across worker threads; workspace secret/symlink scanning (`scan_with_skip`) runs across top-level subdirectories in parallel; `changed_paths_status` combines `git status` and `git diff` in a single pass; clean workspaces skip `snapshot_tree` during `diff`/`status` and `conflicts()` snapshots and merges in parallel.
+- **Desktop app**: Switched `diff` IPC to single-snapshot `diff_bundle` with a 4,000-line patch cap (`truncated`), disabled unused `cli` crate features in `agent-ws-desktop`, added dedicated `disk_usage` IPC, cached `Repo` discovery in the background monitor with adaptive active/idle polling, and debounced filesystem change events.
+- **CI, benchmarks & hygiene**: Pinned GitHub Actions to commit SHAs, added build provenance attestation (`actions/attest-build-provenance`), enabled `Swatinem/rust-cache`, enforced `--locked` builds, added Dependabot config, and hardened `bench/bench.sh`.
+
+### Fixed
+
+- **Core safety & correctness**: Hardened `isolate_submodules` against `gitdir:` path escapes, symlinked `.git`, and untrusted `core.fsmonitor`/hooks; enforced strict `owns()`/`meta()` path binding and symlink checks; made `write_record(..., true)` atomic via temp file + `hard_link`; fixed `.ends_with(".json")` filtering so workspace names containing `.json` do not collide with temp files; preserved non-UTF-8 paths via raw `-z` byte parsing; kept `state = "creating"` until `--branch` and `post_spawn` hooks succeed; added pre-mutation conflict and checked-out-branch checks in `land`; fixed `pid_alive` zombie and `EPERM` handling on macOS and Linux.
+- **Filesystem, Git, Config & Hooks**: Normalized symlink targets in `scan` to block `strip_prefix` traversal and check `is_secret` on symlinks; tightened streaming PEM certificate validation in `only_certificates`; made `relink` atomic; fixed `clone_tree` permission/mtime ordering on read-only directories; removed `FIEMAP_FLAG_SYNC` and guarded `FIEMAP` extent overflow/zero-length loops; added `check_rev` and `--end-of-options` guards across `git.rs` and `main.rs`; added 1 MiB cap and semantic validation to `.agent-ws.toml`; made Claude Code settings reads/writes symlink-safe and atomic while preserving sibling hooks.
+- **Desktop app & UI**: Tightened CSP and `open_with` allowlist/path validation; made tray initialization non-fatal; fixed `refresh()`, `loadDiff()`, and `loadLog()` async staleness races, modal re-entry/double-submit bugs, and keyboard/ARIA accessibility.
+
 ## [0.4.0] - 2026-11-06
 
 ### Added

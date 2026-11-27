@@ -14,6 +14,14 @@ least that much. `agent-ws du` adds that up per workspace. On Linux it reads
 the same from the extents `FIEMAP` does not flag as shared (Btrfs, XFS); the
 measurements below are from a Mac.
 
+Use `agent-ws du --depth 1` (or `--depth 2`) to see which subdirectories inside
+each workspace hold the private bytes without running `du` by hand. `agent-ws
+du` also inspects APFS clone IDs (`ATTR_CMNEXT_CLONEID`) or Linux `FIEMAP`
+shared extent IDs across the source checkout, workspaces, pool, and `.trash` to
+report `cohort shared` (blocks still shared among workspaces/pool/trash that the
+source checkout no longer holds, such as after a reinstall) and `reclaimable`
+bytes (`total.private + cohort_shared_bytes`).
+
 | | `du -A` (logical) | `du` (allocated) | private (real) |
 | --- | --- | --- | --- |
 | one workspace | 814 MB | 943 MB | 10 – 22 MB |
@@ -39,10 +47,14 @@ A check of APFS clone ids (`ATTR_CMNEXT_CLONEID`) found 4 KB held only by
 workspaces and no longer by the source. That did not happen here, but after
 a `pnpm install` in the source every old workspace would own its
 `node_modules` (about 800 MB each), and that would fill a disk quickly. This
-is why the pool is capped and why merged workspaces should go.
+is why the pool is capped, why `agent-ws resync-deps` can CoW-refresh
+dependency directories in long-lived workspaces, and why merged workspaces
+should go.
 
-`private` is a lower bound for a group of workspaces: blocks two workspaces
-share with each other, but not with the source, are private to neither.
+`private` is a lower bound for a single workspace: blocks two workspaces share
+with each other, but not with the source, are private to neither. `cohort
+shared` and `reclaimable` in `agent-ws du` account for that shared cohort
+explicitly so you see the true space freed by cleaning up the whole cohort.
 
 ## What was not the cause
 
@@ -65,22 +77,34 @@ even if all of it came from those workspaces, that is about 100 MB each.
 
 ## What changed
 
-- `agent-ws du` shows the real (private) size next to the `du` size, per
-  workspace, pooled workspace and trash entry, and free disk.
+- `agent-ws du [--depth N]` shows the real (private) size next to the `du` size,
+  per workspace, pooled workspace and trash entry, free disk, optional
+  per-directory breakdown (`--depth`), and `cohort shared` / `reclaimable`
+  bytes (`ATTR_CMNEXT_CLONEID` on macOS, `FIEMAP` shared extent IDs on Linux).
+- `agent-ws resync-deps NAME [PATH…]` (and `agent-ws sync --resync-deps`)
+  reclaims orphaned `node_modules` / build-cache bytes in existing workspaces
+  by atomically CoW-swapping them with the source checkout's current copy.
 - `agent-ws prune` drops workspaces whose work is already merged (see the
-  README). On the real home on 2026-10-22 the dry run found nothing to drop:
-  of 10 workspaces, 5 had staged changes and 5 had 1 – 9 unmerged commits
-  with no PR on GitHub; 6 more records pointed at deleted folders (`gc`).
+  README), and `prune --target-free-gb N` drops the largest eligible workspaces
+  (and clears the pool if needed) until at least `N` GB is free. On the real
+  home on 2026-10-22 the dry run found nothing to drop: of 10 workspaces, 5 had
+  staged changes and 5 had 1 – 9 unmerged commits with no PR on GitHub; 6 more
+  records pointed at deleted folders (`gc`).
 - The background `rm` of `drop` runs in its own process group, so killing
   the agent's terminal no longer leaves trees in `.trash`; the next `drop`
   restarts deletes older than 10 minutes.
-- The pool is capped at 8.
-- `spawn` warns from 20 workspaces (`warn_workspaces`) and below 10 GB free.
+- The pool is capped at 8, and `pool fill` refreshes commit-stale pooled
+  workspaces in place when only `HEAD` moved instead of discarding and
+  re-cloning them.
+- `spawn` warns from 20 workspaces (`warn_workspaces`), below 10 GB free, and
+  when total private disk usage exceeds `max_private_gb` (also shown as `budget`
+  in `agent-ws du`).
 - `spawn` prunes merged workspaces in the background (`auto_prune`), so a
   forgotten `prune` no longer lets them pile up.
 - `gc` no longer deletes record-less folders that hold work. On the real
   home it would have deleted `s0803f-it` (247 uncommitted changes, one
   commit not in `origin/main`); now it registers it again.
 
-No cache exclude list was added: nothing in the measurement was a re-copied
-cache. If a repository has one, list it in `exclude` in `.agent-ws.toml`.
+If a repository has large build outputs or caches you never want copied into
+workspaces, list exact paths or glob patterns (such as `**/node_modules`,
+`apps/*/dist`, or `*.log`) in `exclude` in `.agent-ws.toml`.
