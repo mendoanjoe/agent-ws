@@ -24,9 +24,9 @@
           <button id="refresh" type="button" title="Refresh now">Refresh</button>
         </div>
       </header>
-      <section id="banner" hidden></section>
+      <section id="banner" aria-live="polite" aria-label="Workspace conflicts and overlaps" hidden></section>
       <section id="table-wrap">
-        <table id="workspaces">
+        <table id="workspaces" aria-label="Workspaces">
           <thead>
             <tr>
               <th>Name</th>
@@ -58,11 +58,11 @@
           </div>
         </header>
         <div class="tabs" role="tablist">
-          <button role="tab" data-tab="diff" aria-selected="true" type="button">Diff</button>
-          <button role="tab" data-tab="log" aria-selected="false" type="button">Log</button>
+          <button role="tab" id="tab-btn-diff" aria-controls="tab-diff" data-tab="diff" aria-selected="true" type="button">Diff</button>
+          <button role="tab" id="tab-btn-log" aria-controls="tab-log" data-tab="log" aria-selected="false" type="button">Log</button>
         </div>
-        <div id="tab-diff" class="tab"></div>
-        <div id="tab-log" class="tab" hidden><pre id="log"></pre></div>
+        <div id="tab-diff" role="tabpanel" aria-labelledby="tab-btn-diff" class="tab"></div>
+        <div id="tab-log" role="tabpanel" aria-labelledby="tab-btn-log" class="tab" hidden><pre id="log"></pre></div>
       </section>
     </main>
     <dialog id="dialog">

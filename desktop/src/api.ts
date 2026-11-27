@@ -45,7 +45,17 @@ export type FileChange = {
   deleted: number | null;
 };
 
-export type Diff = { files: FileChange[]; patch: string };
+export type Diff = { files: FileChange[]; patch: string; truncated: boolean };
+
+export type WsUsage = {
+  name: string;
+  path: string;
+  kind: "workspace" | "pool" | "trash";
+  files: number;
+  logical: number;
+  allocated: number;
+  private: number;
+};
 
 export type Landed = {
   branch: string;
@@ -60,6 +70,7 @@ export type Prune = { base: string; pruned: Pruned[]; kept: { name: string; why:
 export const api = {
   repos: () => invoke<Repo[]>("repos"),
   workspaces: (root: string, disk: boolean) => invoke<Workspace[]>("workspaces", { root, disk }),
+  diskUsage: (root: string) => invoke<WsUsage[]>("disk_usage", { root }),
   status: (root: string) => invoke<Status>("status", { root }),
   diff: (root: string, name: string) => invoke<Diff>("diff", { root, name }),
   runLog: (root: string, name: string) => invoke<string | null>("run_log", { root, name }),

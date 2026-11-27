@@ -8,12 +8,15 @@ mod tray;
 
 use tauri::{Manager, WindowEvent};
 
+struct HasTray;
+
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_notification::init())
         .invoke_handler(tauri::generate_handler![
             commands::repos,
             commands::workspaces,
+            commands::disk_usage,
             commands::status,
             commands::diff,
             commands::run_log,
@@ -23,13 +26,22 @@ fn main() {
             commands::open,
         ])
         .setup(|app| {
-            tray::init(app.handle())?;
+            match tray::init(app.handle()) {
+                Ok(()) => {
+                    app.manage(HasTray);
+                }
+                Err(e) => {
+                    eprintln!("agent-ws: tray unavailable: {e}");
+                }
+            }
             monitor::start(app.handle().clone());
             Ok(())
         })
         .on_window_event(|window, event| {
-            // Closing the window keeps the app in the menu bar.
-            if let WindowEvent::CloseRequested { api, .. } = event {
+            // Closing the window keeps the app in the menu bar when a tray is present.
+            if let WindowEvent::CloseRequested { api, .. } = event
+                && window.app_handle().try_state::<HasTray>().is_some()
+            {
                 api.prevent_close();
                 let _ = window.hide();
             }

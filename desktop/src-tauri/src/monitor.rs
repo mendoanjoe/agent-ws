@@ -8,8 +8,9 @@ use std::time::Duration;
 use tauri::{AppHandle, Emitter};
 use tauri_plugin_notification::NotificationExt;
 
-/// How often run records are read; no Git is involved, so it is cheap.
-const EVERY: Duration = Duration::from_secs(3);
+/// How often run records are read when an agent is running vs idle.
+const ACTIVE_EVERY: Duration = Duration::from_secs(3);
+const IDLE_EVERY: Duration = Duration::from_secs(8);
 
 /// Tells the window something changed (`listen("workspaces-changed")`).
 pub const CHANGED: &str = "workspaces-changed";
@@ -18,13 +19,25 @@ pub fn start(app: AppHandle) {
     std::thread::spawn(move || {
         // (repository root, workspace) → (start time, state) of its last run.
         let mut seen: HashMap<(String, String), (u64, String)> = HashMap::new();
+        let mut repos: HashMap<std::path::PathBuf, agent_ws::Repo> = HashMap::new();
+        let mut prev_running: Option<usize> = None;
         let mut first = true;
         loop {
             let mut now = HashMap::new();
             let mut running = 0;
-            for known in agent_ws::known_repos().unwrap_or_default() {
-                let Ok(repo) = agent_ws::Repo::discover(&known.root) else {
-                    continue;
+            let known_list = agent_ws::known_repos().unwrap_or_default();
+            let known_roots: std::collections::HashSet<std::path::PathBuf> =
+                known_list.iter().map(|k| k.root.clone()).collect();
+            repos.retain(|root, _| known_roots.contains(root));
+            for known in known_list {
+                let repo = match repos.entry(known.root.clone()) {
+                    std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+                    std::collections::hash_map::Entry::Vacant(e) => {
+                        let Ok(discovered) = agent_ws::Repo::discover(&known.root) else {
+                            continue;
+                        };
+                        e.insert(discovered)
+                    }
                 };
                 let repo_name = known
                     .root
@@ -50,10 +63,17 @@ pub fn start(app: AppHandle) {
             if now != seen {
                 let _ = app.emit(CHANGED, ());
             }
-            crate::tray::update(&app, running);
+            if prev_running != Some(running) {
+                crate::tray::update(&app, running);
+                prev_running = Some(running);
+            }
             seen = now;
             first = false;
-            std::thread::sleep(EVERY);
+            std::thread::sleep(if running > 0 {
+                ACTIVE_EVERY
+            } else {
+                IDLE_EVERY
+            });
         }
     });
 }
