@@ -177,15 +177,18 @@ pub fn merge_conflicts(dir: &Path, a: &str, b: &str) -> Result<Option<Vec<String
     }
 }
 
-/// Every path a workspace touched since `base`. A rename touches two paths
-/// (the old one is removed), so rename detection is off: removing a file
-/// another workspace edits is an overlap too.
+/// Every path a workspace touched since `base` plus whether the working tree
+/// is dirty (staged, unstaged, or untracked files), in a single `git status` +
+/// `git diff` pass. A rename touches two paths (the old one is removed), so
+/// rename detection is off: removing a file another workspace edits is an
+/// overlap too.
 ///
 /// Read-only: a coordinator polls this while agents commit, and a plain
 /// `git status` rewrites the index under `index.lock`, failing their commits.
-pub fn changed_paths(dir: &Path, base: &str) -> Result<Vec<String>> {
+pub fn changed_paths_status(dir: &Path, base: &str) -> Result<(Vec<String>, bool)> {
     check_rev(base, "base")?;
     let mut paths = Vec::new();
+    let mut dirty = false;
     let out = run_bytes(
         dir,
         &[
@@ -199,6 +202,7 @@ pub fn changed_paths(dir: &Path, base: &str) -> Result<Vec<String>> {
     )?;
     let mut parts = out.split(|&b| b == 0).filter(|s| !s.is_empty());
     while let Some(entry) = parts.next() {
+        dirty = true;
         if entry.len() > 3 {
             paths.push(String::from_utf8_lossy(&entry[3..]).into_owned());
         }
@@ -229,7 +233,12 @@ pub fn changed_paths(dir: &Path, base: &str) -> Result<Vec<String>> {
     }
     paths.sort();
     paths.dedup();
-    Ok(paths)
+    Ok((paths, dirty))
+}
+
+/// Every path a workspace touched since `base`.
+pub fn changed_paths(dir: &Path, base: &str) -> Result<Vec<String>> {
+    Ok(changed_paths_status(dir, base)?.0)
 }
 
 #[cfg(test)]
@@ -242,5 +251,35 @@ mod tests {
         assert!(check_rev("-p", "parent").is_err());
         assert!(check_rev("", "tree").is_err());
         assert!(check_rev("HEAD", "base").is_ok());
+    }
+
+    #[test]
+    fn changed_paths_status_tracks_dirty_and_committed_changes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        run(dir, &["init", "-q"]).unwrap();
+        run(dir, &["config", "user.name", "test"]).unwrap();
+        run(dir, &["config", "user.email", "test@example.com"]).unwrap();
+        std::fs::write(dir.join("a.txt"), "1\n").unwrap();
+        run(dir, &["add", "a.txt"]).unwrap();
+        run(dir, &["commit", "-q", "-m", "init"]).unwrap();
+        let base = line(dir, &["rev-parse", "HEAD"]).unwrap();
+
+        let (paths, dirty) = changed_paths_status(dir, &base).unwrap();
+        assert!(paths.is_empty());
+        assert!(!dirty);
+
+        std::fs::write(dir.join("b.txt"), "2\n").unwrap();
+        run(dir, &["add", "b.txt"]).unwrap();
+        run(dir, &["commit", "-q", "-m", "add b"]).unwrap();
+        let (paths, dirty) = changed_paths_status(dir, &base).unwrap();
+        assert_eq!(paths, ["b.txt"]);
+        assert!(!dirty);
+
+        std::fs::write(dir.join("c.txt"), "3\n").unwrap();
+        let (paths, dirty) = changed_paths_status(dir, &base).unwrap();
+        assert_eq!(paths, ["b.txt", "c.txt"]);
+        assert!(dirty);
+        assert_eq!(changed_paths(dir, &base).unwrap(), paths);
     }
 }

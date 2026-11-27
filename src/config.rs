@@ -49,6 +49,11 @@ pub struct Config {
     pub strict_symlinks: bool,
     /// Refuse to spawn below this much free disk space.
     pub min_free_gb: Option<u64>,
+    /// Refuse to spawn when workspaces' private disk usage reaches this many GiB.
+    pub max_private_gb: Option<u64>,
+    /// Glob patterns for directory subtrees skipped during secret/symlink scan.
+    #[serde(default)]
+    pub scan_skip: Vec<String>,
     /// Pooled workspaces to keep ready.
     pub pool: Option<usize>,
     /// Files whose change makes pooled workspaces stale (replaces the defaults).
@@ -110,6 +115,10 @@ impl Config {
     fn validate(&mut self, path: &Path) -> Result<()> {
         for e in &mut self.exclude {
             *e = normalize_rel_path(e, "exclude")
+                .with_context(|| format!("invalid {}", path.display()))?;
+        }
+        for s in &mut self.scan_skip {
+            *s = normalize_rel_path(s, "scan_skip")
                 .with_context(|| format!("invalid {}", path.display()))?;
         }
         if let Some(stamps) = &mut self.pool_stamp {
@@ -228,6 +237,35 @@ mod tests {
             "port_base = 0\n",
             "port_step = 0\n",
             "prune_base = \"--exec=sh\"\n",
+        ] {
+            std::fs::write(tmp.path().join(FILE), bad).unwrap();
+            assert!(Config::load(tmp.path()).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn config_supports_glob_excludes_scan_skip_and_max_private_gb() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join(FILE),
+            "exclude = [\"./**/node_modules/\", \"apps/*/dist\", \"*.log\"]\n\
+             scan_skip = [\"./target\", \"**/node_modules\", \"apps/*/dist\"]\n\
+             max_private_gb = 25\n",
+        )
+        .unwrap();
+        let cfg = Config::load(tmp.path()).unwrap();
+        assert_eq!(cfg.exclude, ["**/node_modules", "apps/*/dist", "*.log"]);
+        assert_eq!(cfg.scan_skip, ["target", "**/node_modules", "apps/*/dist"]);
+        assert_eq!(cfg.max_private_gb, Some(25));
+
+        for bad in [
+            "exclude = [\"\"]\n",
+            "exclude = [\"../**/node_modules\"]\n",
+            "exclude = [\"/var/*.log\"]\n",
+            "scan_skip = [\"\"]\n",
+            "scan_skip = [\"../target\"]\n",
+            "scan_skip = [\"/abs/path\"]\n",
+            "scan_skip = [\".\"]\n",
         ] {
             std::fs::write(tmp.path().join(FILE), bad).unwrap();
             assert!(Config::load(tmp.path()).is_err(), "{bad}");
